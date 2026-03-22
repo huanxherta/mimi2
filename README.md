@@ -1,141 +1,139 @@
-# 小米AI Studio Claw 自动化控制系统
+# Xiaomi AI Studio Claw Automation Control
 
-一个完整的网页控制面板，用于管理小米AI Studio Claw的自动化任务，包括环境重置、密钥管理、OpenAI协议中转等功能。
+A web control panel for Xiaomi AI Studio Claw automation: environment reset, credential and key management, and an OpenAI-compatible relay.
 
-## 功能特性
+## Features
 
-### 🌐 网页控制面板
-- 现代化的Web界面
-- 实时状态监控
-- 任务执行日志
+### Web control panel
+- Modern web UI
+- Live status
+- Task logs
 
-### 👥 用户管理
-- 批量导入小米凭证
-- 自动识别多种凭证格式
-- 用户切换和管理
+### User management
+- Bulk import of Xiaomi credentials
+- Multiple credential formats (auto-detected)
+- User switching
 
-### 🔄 自动化任务
-- 一键环境重置
-- SOUL模板恢复
-- 环境变量备份
+### Automation
+- One-click environment reset
+- SOUL template restore
+- Environment variable backup
 
-### 🔑 密钥管理
-- 自动提取MIMO API密钥
-- 密钥有效性验证
-- 每 50 分钟经 MIMO API 校验 OC（401 则自动走 Claw 重取密钥）
+### Key management
+- Automatic MIMO API key extraction
+- Key validation
+- Every ~50 minutes the app calls the MIMO API to validate the OC key; on **401** it refreshes the key via Claw
 
-### 🌉 OpenAI协议中转
-- 兼容OpenAI API格式
-- 自动密钥注入
-- 支持多种模型映射
+### OpenAI-compatible relay
+- OpenAI API–compatible surface
+- Automatic key injection for upstream MIMO
+- Model name mapping
 
-## 快速开始
+## Quick start
 
-### 1. 启动网页控制面板
+### 1. Run the web panel
 
-**Windows:**
+From the project directory:
+
 ```bash
-双击运行 start_web.bat
+python claw_web.py
 ```
 
-**Linux/Mac:**
-```bash
-python3 claw_web.py
+If `python` is not available, try `python3` or on Windows `py -3`.
+
+Open: http://localhost:10060
+
+The same port **10060** exposes an OpenAI-compatible API: set the client `base_url` to `http://localhost:10060/v1`. In the background, `GET /v1/models` runs about every 50 minutes to validate the OC; on **401**, Claw is used to fetch a new key.
+
+### 2. Import Xiaomi credentials
+
+In the UI: **User management** → **Bulk import**. Supported formats:
+
+#### CSV
+
+```
+name,userId,serviceToken,xiaomichatbot_ph
+Example,1234567890,/your-service-token-here...,your-xiaomichatbot-ph-here...
 ```
 
-访问: http://localhost:10060
+#### JSON
 
-同一端口 **10060** 提供 OpenAI 兼容接口，将客户端 `base_url` 设为 `http://localhost:10060/v1` 即可。后台每 50 分钟请求 MIMO `GET /v1/models` 校验 OC，若返回 **401** 则自动通过 Claw 重新获取密钥。
-
-### 2. 导入小米凭证
-
-在网页中找到"用户管理" -> "批量导入小米凭证"，支持以下格式：
-
-#### CSV格式：
-```
-用户名,userId,serviceToken,xiaomichatbot_ph
-示例用户,1234567890,/your-service-token-here...,your-xiaomichatbot-ph-here...
-```
-
-#### JSON格式：
 ```json
-{"name":"示例用户", "userId":"1234567890", "serviceToken":"/your-service-token-here...", "xiaomichatbot_ph":"your-ph-here..."}
+{"name":"Example", "userId":"1234567890", "serviceToken":"/your-service-token-here...", "xiaomichatbot_ph":"your-ph-here..."}
 ```
 
-#### Netscape Cookie格式：
+#### Netscape cookie file
+
 ```
 .xiaomimimo.com	TRUE	/	FALSE	1776696187	serviceToken	"/your-service-token-here..."
 .xiaomimimo.com	TRUE	/	FALSE	1776724987	userId	1234567890
 .xiaomimimo.com	TRUE	/	FALSE	1776696187	xiaomichatbot_ph	"your-ph-here..."
 ```
 
-### 3. 执行环境重置
+### 3. Environment reset
 
-点击"启动环境重置"按钮，系统将：
-- 连接到Claw
-- 重置SOUL模板
-- 备份环境变量
-- 提取MIMO API密钥
+Click **Start environment reset**. The app will:
+- Connect to Claw
+- Reset the SOUL template
+- Back up environment variables
+- Extract the MIMO API key
 
-### 4. 使用 OpenAI 兼容 API
+### 4. OpenAI-compatible API
 
-获取密钥后，将客户端指向本机 `http://localhost:10060/v1`；直连小米云端可使用 `https://api.xiaomimimo.com`。
+After you have a key, point the client at `http://localhost:10060/v1` for the local relay. For direct access to Xiaomi’s cloud, use `https://api.xiaomimimo.com`.
 
-## API使用示例
+## API example
 
 ```python
 import openai
 
-# 配置客户端
 client = openai.OpenAI(
     api_key="your-mimo-key-here",
     base_url="https://api.xiaomimimo.com"
 )
 
-# 使用聊天完成
 response = client.chat.completions.create(
     model="gpt-3.5-turbo",
     messages=[{"role": "user", "content": "Hello!"}]
 )
 ```
 
-## 文件说明
+## File layout
 
-- `claw_web.py` - 主网页控制面板（默认端口 **10060**）
-- `mimo_openai_shared.py` - OpenAI 中转共享常量与映射（供 `claw_web` / `claw_proxy` 共用）
-- `claw_proxy.py` - 可选独立中转（默认 **8000**，一般无需使用；面板已内嵌 `/v1`）
-- `claw_chat.py` - Claw 聊天客户端核心
-- `claw_reset_env.py` - 环境重置自动化脚本
-- `users/` - 面板导入的小米账号（`user_*.json`）与 `default.json`
-- `app_state.json` - 当前全局 OC、体验到期等运行时状态（由面板写入）
-- `oc_history.json` - 被替换/销毁的 OC 预览历史（若存在）
-- `claw_users.json` - `claw_chat` 遗留用户表（与面板 `users/` 独立，一般可不编辑）
-- `start_web.bat` - Windows 启动脚本
-- `archive/` - **非运行时**归档（如 HTTP 抓包样本），详见 `archive/README.txt`
+- `claw_web.py` — Main web panel (default port **10060**)
+- `mimo_openai_shared.py` — Shared relay constants and model mapping (used by `claw_web` and `claw_proxy`)
+- `claw_proxy.py` — Optional standalone relay (default **8000**; usually unnecessary because the panel embeds `/v1`)
+- `claw_chat.py` — Claw chat client core
+- `claw_reset_env.py` — Environment reset automation
+- `users/` — Imported Xiaomi accounts (`user_*.json`, `default.json`)
+- `app_state.json` — Runtime state (global OC, trial expiry, etc.), written by the panel
+- `oc_history.json` — History of replaced/revoked OC previews (if present)
+- `claw_users.json` — Legacy user table for `claw_chat` (separate from `users/`)
+- `archive/` — Non-runtime archive (e.g. HTTP capture notes); see `archive/README.txt`
 
-## 安全注意事项
+## Security
 
-- 凭证文件包含敏感信息，请妥善保管；`users/*.json`、`app_state.json` 等已列入 `.gitignore`，勿将真实数据提交到公开仓库
-- 可选：复制 `env.example` 为 `.env` 并设置 `MIMO_RELAY_OPENAI_KEY`，为本地 `/v1` 中转配置独立 Bearer（不设则不对客户端 api_key 做校验，仅适合本机调试）
-- 建议在本地网络环境中运行
-- 定期更新小米凭证以避免过期
+- Credential files are sensitive; `users/*.json`, `app_state.json`, etc. are listed in `.gitignore` — do not commit real data to a public repo.
+- Optional: copy `env.example` to `.env` and set `MIMO_RELAY_OPENAI_KEY` to a random `sk-...` value so the local `/v1` relay requires a Bearer token. If unset, the relay does not validate the client `api_key` (convenient for local debugging only).
+- Prefer running on a trusted local network.
+- Refresh Xiaomi credentials before they expire.
 
-## 故障排除
+## Troubleshooting
 
-### 连接失败
-- 检查小米凭证是否有效
-- 确认网络连接正常
+### Connection failures
+- Verify Xiaomi credentials are still valid
+- Check network connectivity
 
-### 密钥提取失败
-- 确保Claw服务正常运行
-- 检查用户权限
+### Key extraction fails
+- Ensure the Claw service is running
+- Check account permissions
 
-### 中转或校验失败
-- 确认已获取有效的 MIMO API 密钥
-- 检查本机 **10060** 是否被占用；若单独运行 `claw_proxy.py` 再检查 **8000**
+### Relay or validation errors
+- Confirm a valid MIMO API key is available
+- Ensure port **10060** is free; if you run `claw_proxy.py` alone, check **8000**
 
-## 更新日志
+## Changelog
 
-- v1.0: 初始版本，支持基础自动化功能
-- v1.1: 添加网页控制面板和OpenAI中转
-- v1.2: 改进凭证自动识别和密钥轮询
+- v1.0: Initial release with basic automation
+- v1.1: Web panel and OpenAI relay
+- v1.2: Improved credential parsing and key refresh
