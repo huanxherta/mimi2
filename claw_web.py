@@ -208,6 +208,12 @@ HTML_TEMPLATE = """
         <div class="section">
             <h2>✨ 系统状态</h2>
             <button type="button" onclick="manualRefresh()">手动刷新 OC</button>
+            <div style="margin-top:14px; display:flex; align-items:center; gap:10px; flex-wrap:wrap;">
+                <label style="font-size:0.88rem; color:#546e7a;">OC 401 最大重试次数：</label>
+                <input type="number" id="ocMaxRetry" min="1" max="10" value="3" style="width:70px; padding:6px 8px; margin:0;">
+                <button type="button" class="btn-ghost" onclick="saveOcMaxRetry()" style="font-size:0.82rem; padding:7px 14px;">保存</button>
+                <span style="font-size:0.78rem; color:#78909c;">（1-10，默认 3；/v1 请求遇 401 时自动换 key 重试）</span>
+            </div>
         </div>
 
         <div class="section">
@@ -781,6 +787,24 @@ HTML_TEMPLATE = """
                 });
         }
 
+        function saveOcMaxRetry() {
+            var v = parseInt(document.getElementById('ocMaxRetry').value, 10);
+            if (isNaN(v) || v < 1) v = 1;
+            if (v > 10) v = 10;
+            document.getElementById('ocMaxRetry').value = v;
+            fetch('/api/update_app_state', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ oc_max_retry: v })
+            })
+                .then(function(r) { return r.json(); })
+                .then(function(data) {
+                    if (data.success) uiLog('OC 最大重试次数已设为 ' + v);
+                    else uiLog('保存失败: ' + (data.error || ''));
+                })
+                .catch(function(e) { uiLog('保存失败: ' + String(e)); });
+        }
+
         function destroyClaw() {
             if (confirm('确定要销毁Claw实例吗？这将清除所有相关数据和密钥！')) {
                 fetch('/api/destroy_claw', { method: 'POST' })
@@ -801,6 +825,9 @@ HTML_TEMPLATE = """
 
         loadOcCatalog();
         refreshAccountsHealth();
+        fetch('/api/status').then(function(r){return r.json();}).then(function(d){
+            if (d.oc_max_retry != null) document.getElementById('ocMaxRetry').value = d.oc_max_retry;
+        }).catch(function(){});
     </script>
 </body>
 </html>
@@ -1309,8 +1336,8 @@ def iter_relay_oc_display_rows():
         }
 
 
-def pick_relay_oc_round_robin():
-    """轮询返回 (panel_uid, oc_key)；无可用时 (None, None)。"""
+def pick_relay_oc_round_robin(skip=None):
+    """轮询返回 (panel_uid, oc_key)；skip=set() 跳过已试过的key。无可用时 (None, None)。"""
     global _relay_rr_idx
     pool = build_relay_oc_pool()
     if not pool:
@@ -1322,12 +1349,66 @@ def pick_relay_oc_round_robin():
         if u_def and u_def.get("mimo_trial_no_expire"):
             return None, None
         if mimo_api_key and validate_key(mimo_api_key):
+            if skip and mimo_api_key in skip:
+                return None, None
             return None, mimo_api_key
+        return None, None
+    if skip:
+        pool = [(rk, k) for rk, k in pool if k not in skip]
+    if not pool:
         return None, None
     with _relay_rr_lock:
         i = _relay_rr_idx % len(pool)
         _relay_rr_idx += 1
         return pool[i]
+
+
+def _background_refresh_oc(rk):
+    """后台线程：Claw重拉指定账号的OC，不影响主请求。"""
+    def _do():
+        try:
+            log_message(f"后台重拉 OC: 账号 {rk}")
+            force_refresh_mimo_key_via_claw(uid_pref=rk, retry=False)
+            log_message(f"后台重拉完成: 账号 {rk}")
+        except Exception as e:
+            log_message(f"后台重拉异常: {rk}: {e}")
+    t = threading.Thread(target=_do, daemon=True)
+    t.start()
+
+
+def _retry_on_401(request, send_func):
+    """
+    通用401重试：遇到401换下一个OC+后台重拉坏key，最多max_retry次。
+    send_func(oc_key) -> Response，返回最终Response。
+    """
+    tried = set()
+    max_retry = load_app_state().get("oc_max_retry", 3)
+
+    for attempt in range(max_retry):
+        rk, k = pick_relay_oc_round_robin(skip=tried)
+        if not k:
+            break
+        tried.add(k)
+        g.relay_oc_rk = rk
+        g.relay_oc_key = k
+
+        resp = send_func(k)
+
+        if resp.status_code == 401:
+            log_message(f"OC {rk} 返回401，换下一个（{attempt+1}/{max_retry}）")
+            if rk:
+                _background_refresh_oc(rk)
+            continue
+
+        return resp
+
+    # 全部失败
+    return jsonify({
+        "error": {
+            "message": "All OC keys exhausted (401), tried " + str(len(tried)) + " keys",
+            "type": "authentication_error"
+        }
+    }), 401
 
 
 def _probe_chat_timeout_retryable(exc):
@@ -1925,7 +2006,8 @@ def api_status():
         'users': users_data.get('users', {}),
         'default_user': users_data.get('default', '1'),
         'active_user': active_user,
-        'last_refresh_error': last_refresh_error
+        'last_refresh_error': last_refresh_error,
+        'oc_max_retry': app_state.get('oc_max_retry', 3),
     })
 
 
@@ -2315,232 +2397,148 @@ def openai_v1_index():
 
 @app.route('/v1/chat/completions', methods=['POST'])
 def openai_chat_completions():
-    """中转OpenAI聊天完成请求到MIMO（多账号 OC 轮询）。"""
+    """中转OpenAI聊天完成请求到MIMO（多账号 OC 轮询 + 401自动重试）。"""
     gate = ensure_v1_relay_ready()
     if gate is not None:
         return gate
 
-    try:
-        rk, k = pick_relay_oc_round_robin()
-        if not k:
-            return jsonify(
-                {
-                    "error": {
-                        "message": "无可用 OC，请在面板导入凭证并经 Claw 拉取密钥",
-                        "type": "authentication_error",
-                    }
-                }
-            ), 401
-        g.relay_oc_rk = rk
-        g.relay_oc_key = k
-        log_message(f"/v1/chat 使用 OC 账号={rk or '全局'} 轮询转发")
+    def send(oc_key):
+        try:
+            data, headers = transform_openai_request(request)
+            log_message(f"转换后的模型: {data.get('model', 'unknown')}")
+            log_message(f"聊天请求摘要: {json.dumps(chat_completion_log_summary(data), ensure_ascii=False)}")
 
-        # 转换请求
-        data, headers = transform_openai_request(request)
-        log_message(f"转换后的模型: {data.get('model', 'unknown')}")
-        log_message(f"聊天请求摘要: {json.dumps(chat_completion_log_summary(data), ensure_ascii=False)}")
-
-        if data.get("stream"):
-            return _mimo_chat_stream_response(request, data, headers)
-
-        # 发送到MIMO API（非流式）
-        response = requests.post(
-            f"{MIMO_BASE_URL}/v1/chat/completions",
-            json=data,
-            headers=headers,
-            timeout=120
-        )
-
-        if response.status_code == 401:
-            rr = getattr(g, "relay_oc_rk", None)
-            log_message(f"MIMO 返回 401，尝试对账号 {rr} 经 Claw 重拉 OC 并重试")
-            if force_refresh_mimo_key_via_claw(uid_pref=rr):
-                rk2, k2 = pick_relay_oc_round_robin()
-                g.relay_oc_rk = rk2
-                g.relay_oc_key = k2 or mimo_api_key
-                data, headers = transform_openai_request(request)
+            if data.get("stream"):
+                # 流式需要特殊处理，401时返回Response对象让外层判断
+                url = f"{MIMO_BASE_URL}/v1/chat/completions"
+                r = requests.post(url, json=data, headers=headers, timeout=120, stream=True)
+                if r.status_code == 401:
+                    r.close()
+                    return Response(r.content, status=401, content_type=r.headers.get('content-type', 'application/json'))
+                # 非401正常流式返回
+                ct = r.headers.get("content-type", "text/event-stream; charset=utf-8")
+                def gen():
+                    try:
+                        for chunk in r.iter_content(chunk_size=8192):
+                            if chunk:
+                                yield chunk
+                    finally:
+                        r.close()
+                return Response(stream_with_context(gen()), status=200, content_type=ct)
+            else:
                 response = requests.post(
                     f"{MIMO_BASE_URL}/v1/chat/completions",
-                    json=data,
-                    headers=headers,
-                    timeout=120
+                    json=data, headers=headers, timeout=120
                 )
+                if response.status_code == 401:
+                    return Response(response.content, status=401, content_type=response.headers.get('content-type', 'application/json'))
+                transformed_data = transform_openai_response(response)
+                return Response(
+                    json.dumps(transformed_data),
+                    status=response.status_code,
+                    content_type=response.headers.get('content-type', 'application/json')
+                )
+        except Exception as e:
+            log_message(f"OpenAI中转错误: {e}")
+            return jsonify({
+                "error": {
+                    "message": f"Proxy error: {str(e)}",
+                    "type": "proxy_error"
+                }
+            }), 500
 
-        log_message(f"MIMO API响应状态: {response.status_code}")
-
-        # 转换响应
-        transformed_data = transform_openai_response(response)
-
-        # 返回响应
-        return Response(
-            json.dumps(transformed_data),
-            status=response.status_code,
-            content_type=response.headers.get('content-type', 'application/json')
-        )
-
-    except Exception as e:
-        log_message(f"OpenAI中转错误: {e}")
-        return jsonify({
-            "error": {
-                "message": f"Proxy error: {str(e)}",
-                "type": "proxy_error"
-            }
-        }), 500
+    return _retry_on_401(request, send)
 
 @app.route('/v1/models', methods=['GET'])
 def openai_list_models():
-    """中转OpenAI模型列表请求（与 chat 共用轮询 OC）。"""
+    """中转OpenAI模型列表请求（与 chat 共用轮询 OC + 401自动重试）。"""
     gate = ensure_v1_relay_ready()
     if gate is not None:
         return gate
 
-    try:
-        rk, k = pick_relay_oc_round_robin()
-        if not k:
-            return jsonify(
-                {
-                    "error": {
-                        "message": "无可用 OC",
-                        "type": "authentication_error",
-                    }
+    def send(oc_key):
+        try:
+            headers = build_mimo_json_headers(oc_key)
+            response = requests.get(
+                f"{MIMO_BASE_URL}/v1/models",
+                headers=headers,
+                timeout=30
+            )
+            if response.status_code == 401:
+                return Response(response.content, status=401, content_type=response.headers.get('content-type', 'application/json'))
+            transformed_data = transform_openai_response(response)
+            return Response(
+                json.dumps(transformed_data),
+                status=response.status_code,
+                content_type=response.headers.get('content-type', 'application/json')
+            )
+        except Exception as e:
+            log_message(f"模型列表中转错误: {e}")
+            return jsonify({
+                "error": {
+                    "message": f"Proxy error: {str(e)}",
+                    "type": "proxy_error"
                 }
-            ), 401
-        g.relay_oc_rk = rk
-        g.relay_oc_key = k
-        headers = build_mimo_json_headers(k)
+            }), 500
 
-        response = requests.get(
-            f"{MIMO_BASE_URL}/v1/models",
-            headers=headers,
-            timeout=30
-        )
-
-        if response.status_code == 401:
-            rr = getattr(g, "relay_oc_rk", None)
-            log_message(f"MIMO models 401，尝试对账号 {rr} 经 Claw 重拉 OC")
-            if force_refresh_mimo_key_via_claw(uid_pref=rr):
-                rk2, k2 = pick_relay_oc_round_robin()
-                g.relay_oc_rk = rk2
-                g.relay_oc_key = k2 or mimo_api_key
-                headers = build_mimo_json_headers(getattr(g, "relay_oc_key", None) or mimo_api_key)
-                response = requests.get(
-                    f"{MIMO_BASE_URL}/v1/models",
-                    headers=headers,
-                    timeout=30
-                )
-
-        transformed_data = transform_openai_response(response)
-
-        return Response(
-            json.dumps(transformed_data),
-            status=response.status_code,
-            content_type=response.headers.get('content-type', 'application/json')
-        )
-
-    except Exception as e:
-        log_message(f"模型列表中转错误: {e}")
-        return jsonify({
-            "error": {
-                "message": f"Proxy error: {str(e)}",
-                "type": "proxy_error"
-            }
-        }), 500
+    return _retry_on_401(request, send)
 
 @app.route('/v1/<path:path>', methods=['GET', 'POST', 'PUT', 'DELETE', 'PATCH', 'OPTIONS'])
 def openai_proxy_all(path):
-    """通用OpenAI API中转路由"""
+    """通用OpenAI API中转路由（401自动重试）"""
     gate = ensure_v1_relay_ready()
     if gate is not None:
         return gate
 
-    try:
-        rk, k = pick_relay_oc_round_robin()
-        if not k:
-            return jsonify(
-                {
-                    "error": {
-                        "message": "无可用 OC",
-                        "type": "authentication_error",
-                    }
+    def send(oc_key):
+        try:
+            headers = dict(request.headers)
+            headers['Authorization'] = f'Bearer {oc_key}'
+            # 移除可能导致问题的头部
+            headers.pop('Host', None)
+
+            url = f"{MIMO_BASE_URL}/v1/{path}"
+
+            # 根据请求方法处理
+            if request.method in ['POST', 'PUT', 'PATCH']:
+                response = requests.request(
+                    request.method,
+                    url,
+                    json=request.get_json() if request.is_json else None,
+                    data=request.get_data() if not request.is_json else None,
+                    headers=headers,
+                    params=request.args,
+                    timeout=120
+                )
+            else:
+                response = requests.request(
+                    request.method,
+                    url,
+                    headers=headers,
+                    params=request.args,
+                    timeout=120
+                )
+
+            if response.status_code == 401:
+                return Response(response.content, status=401, content_type=response.headers.get('content-type', 'application/json'))
+
+            transformed_data = transform_openai_response(response)
+
+            return Response(
+                json.dumps(transformed_data) if isinstance(transformed_data, dict) else transformed_data,
+                status=response.status_code,
+                content_type=response.headers.get('content-type', 'application/json')
+            )
+        except Exception as e:
+            log_message(f"通用中转错误: {e}")
+            return jsonify({
+                "error": {
+                    "message": f"Proxy error: {str(e)}",
+                    "type": "proxy_error"
                 }
-            ), 401
-        g.relay_oc_rk = rk
-        g.relay_oc_key = k
+            }), 500
 
-        headers = dict(request.headers)
-        headers['Authorization'] = f'Bearer {k}'
-
-        # 移除可能导致问题的头部
-        headers.pop('Host', None)
-
-        url = f"{MIMO_BASE_URL}/v1/{path}"
-
-        # 根据请求方法处理
-        if request.method in ['POST', 'PUT', 'PATCH']:
-            response = requests.request(
-                request.method,
-                url,
-                json=request.get_json() if request.is_json else None,
-                data=request.get_data() if not request.is_json else None,
-                headers=headers,
-                params=request.args,
-                timeout=120
-            )
-        else:
-            response = requests.request(
-                request.method,
-                url,
-                headers=headers,
-                params=request.args,
-                timeout=120
-            )
-
-        if response.status_code == 401:
-            rr = getattr(g, "relay_oc_rk", None)
-            log_message(f"MIMO 通用 /v1/{path} 401，尝试对账号 {rr} 经 Claw 重拉 OC")
-            if force_refresh_mimo_key_via_claw(uid_pref=rr):
-                rk2, k2 = pick_relay_oc_round_robin()
-                g.relay_oc_rk = rk2
-                g.relay_oc_key = k2 or mimo_api_key
-                k3 = getattr(g, "relay_oc_key", None) or mimo_api_key
-                headers = dict(request.headers)
-                headers['Authorization'] = f'Bearer {k3}'
-                headers.pop('Host', None)
-                if request.method in ['POST', 'PUT', 'PATCH']:
-                    response = requests.request(
-                        request.method,
-                        url,
-                        json=request.get_json() if request.is_json else None,
-                        data=request.get_data() if not request.is_json else None,
-                        headers=headers,
-                        params=request.args,
-                        timeout=120
-                    )
-                else:
-                    response = requests.request(
-                        request.method,
-                        url,
-                        headers=headers,
-                        params=request.args,
-                        timeout=120
-                    )
-
-        transformed_data = transform_openai_response(response)
-
-        return Response(
-            json.dumps(transformed_data) if isinstance(transformed_data, dict) else transformed_data,
-            status=response.status_code,
-            content_type=response.headers.get('content-type', 'application/json')
-        )
-
-    except Exception as e:
-        log_message(f"通用中转错误: {e}")
-        return jsonify({
-            "error": {
-                "message": f"Proxy error: {str(e)}",
-                "type": "proxy_error"
-            }
-        }), 500
+    return _retry_on_401(request, send)
 
 if __name__ == '__main__':
     sync_mimo_key_from_app_state()
