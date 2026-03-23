@@ -12,7 +12,7 @@ import secrets
 from concurrent.futures import ThreadPoolExecutor
 import requests
 from requests.exceptions import Timeout
-from flask import Flask, render_template_string, request, jsonify, Response, g
+from flask import Flask, render_template_string, request, jsonify, Response, g, stream_with_context
 from urllib.parse import quote
 import sys
 import re
@@ -276,9 +276,42 @@ HTML_TEMPLATE = """
             window.alert(message);
         }
 
+        /** 非 HTTPS（如 http://公网IP）下 navigator.clipboard 常为 undefined，需 fallback */
+        function copyTextToClipboard(text) {
+            var s = String(text);
+            if (!s) return Promise.reject(new Error('empty'));
+            if (typeof navigator !== 'undefined' && navigator.clipboard && typeof navigator.clipboard.writeText === 'function' && window.isSecureContext) {
+                return navigator.clipboard.writeText(s);
+            }
+            return new Promise(function(resolve, reject) {
+                try {
+                    var ta = document.createElement('textarea');
+                    ta.value = s;
+                    ta.setAttribute('readonly', '');
+                    ta.style.position = 'fixed';
+                    ta.style.left = '-9999px';
+                    ta.style.top = '0';
+                    document.body.appendChild(ta);
+                    ta.focus();
+                    ta.select();
+                    ta.setSelectionRange(0, s.length);
+                    var ok = document.execCommand('copy');
+                    document.body.removeChild(ta);
+                    if (ok) resolve();
+                    else reject(new Error('execCommand'));
+                } catch (e) {
+                    reject(e);
+                }
+            });
+        }
+
         function copyText(text) {
             if (!text) return;
-            navigator.clipboard.writeText(text).then(() => userAlert('已复制到剪贴板')).catch(() => userAlert('复制失败，请手动选择复制'));
+            copyTextToClipboard(text).then(function() {
+                userAlert('已复制到剪贴板');
+            }).catch(function() {
+                userAlert('复制失败，请手动选择复制');
+            });
         }
 
         function escapeHtml(s) {
@@ -425,7 +458,17 @@ HTML_TEMPLATE = """
                     var msg = data.synced_from_global
                         ? '该账号本地尚未保存过 OC，已使用当前全局中转密钥复制，并已写入本账号文件。（体验剩余来自 mimo-claw/status，与是否持久化 OC 不是同一项。）'
                         : '该账号已保存的 MIMO OC 已复制到剪贴板';
-                    return navigator.clipboard.writeText(data.line).then(() => userAlert(msg));
+                    var line = data.line;
+                    return copyTextToClipboard(line)
+                        .then(function() { userAlert(msg); })
+                        .catch(function() {
+                            uiLog('[面板] 剪贴板不可用，已弹出手动复制');
+                            try {
+                                window.prompt('请手动全选复制（Ctrl+C）：', line);
+                            } catch (_) {
+                                userAlert('复制失败，请从服务器 users 目录查看 OC');
+                            }
+                        });
                 })
                 .catch(e => userAlert(String(e)))
                 .finally(() => { if (btnEl) btnEl.disabled = false; });
@@ -785,6 +828,50 @@ def transform_openai_request(openai_request):
 def transform_openai_response(mimo_response):
     """将MIMO响应转换为OpenAI格式"""
     return transform_mimo_response_json(mimo_response)
+
+
+def _mimo_chat_stream_response(openai_request, data, headers):
+    """
+    stream: true 时：向 MIMO 发起流式请求，将 text/event-stream 原样转发给客户端。
+    401 时与整包模式相同：尝试经 Claw 刷新 OC 后重试一次。
+    """
+    url = f"{MIMO_BASE_URL}/v1/chat/completions"
+    r = requests.post(url, json=data, headers=headers, timeout=120, stream=True)
+    if r.status_code == 401:
+        body401 = r.content
+        ct401 = r.headers.get("content-type", "application/json")
+        r.close()
+        rr = getattr(g, "relay_oc_rk", None)
+        log_message(f"MIMO 流式 401，尝试对账号 {rr} 经 Claw 重拉 OC 并重试")
+        if force_refresh_mimo_key_via_claw(uid_pref=rr):
+            rk2, k2 = pick_relay_oc_round_robin()
+            g.relay_oc_rk = rk2
+            g.relay_oc_key = k2 or mimo_api_key
+            data, headers = transform_openai_request(openai_request)
+            r = requests.post(url, json=data, headers=headers, timeout=120, stream=True)
+        else:
+            return Response(body401, status=401, content_type=ct401)
+
+    log_message(f"MIMO API流式响应状态: {r.status_code}")
+
+    if r.status_code != 200:
+        err = r.content
+        ct = r.headers.get("content-type", "application/json")
+        st = r.status_code
+        r.close()
+        return Response(err, status=st, content_type=ct)
+
+    ct = r.headers.get("content-type", "text/event-stream; charset=utf-8")
+
+    def gen():
+        try:
+            for chunk in r.iter_content(chunk_size=8192):
+                if chunk:
+                    yield chunk
+        finally:
+            r.close()
+
+    return Response(stream_with_context(gen()), status=200, content_type=ct)
 
 
 def norm_uid(uid):
@@ -2221,7 +2308,10 @@ def openai_chat_completions():
         log_message(f"转换后的模型: {data.get('model', 'unknown')}")
         log_message(f"聊天请求摘要: {json.dumps(chat_completion_log_summary(data), ensure_ascii=False)}")
 
-        # 发送到MIMO API
+        if data.get("stream"):
+            return _mimo_chat_stream_response(request, data, headers)
+
+        # 发送到MIMO API（非流式）
         response = requests.post(
             f"{MIMO_BASE_URL}/v1/chat/completions",
             json=data,

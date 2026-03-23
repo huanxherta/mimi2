@@ -8,7 +8,7 @@ import os
 import json
 import time
 import requests
-from flask import Flask, request, jsonify, Response
+from flask import Flask, request, jsonify, Response, stream_with_context
 import sys
 
 # 导入配置
@@ -56,7 +56,30 @@ def chat_completions():
         # 转换请求
         data, headers = transform_request(request)
 
-        # 发送到MIMO API
+        if data.get("stream"):
+            url = f"{MIMO_BASE_URL}/v1/chat/completions"
+            r = requests.post(url, json=data, headers=headers, timeout=120, stream=True)
+            log_st = f"MIMO API流式响应状态: {r.status_code}"
+            print(log_st, file=sys.stderr)
+            if r.status_code != 200:
+                err = r.content
+                ct = r.headers.get("content-type", "application/json")
+                st = r.status_code
+                r.close()
+                return Response(err, status=st, content_type=ct)
+            ct = r.headers.get("content-type", "text/event-stream; charset=utf-8")
+
+            def gen():
+                try:
+                    for chunk in r.iter_content(chunk_size=8192):
+                        if chunk:
+                            yield chunk
+                finally:
+                    r.close()
+
+            return Response(stream_with_context(gen()), status=200, content_type=ct)
+
+        # 发送到MIMO API（非流式）
         response = requests.post(
             f"{MIMO_BASE_URL}/v1/chat/completions",
             json=data,
