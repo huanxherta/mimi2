@@ -1988,6 +1988,7 @@ def api_account_copy_line():
 @app.route('/api/status')
 def api_status():
     users_data = load_users()
+    app_state = load_app_state()
     global active_user
     du = resolve_user_key(users_data.get('users', {}), users_data.get('default', '1'))
     active_user = du or users_data.get('default', '1')
