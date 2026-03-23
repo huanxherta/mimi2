@@ -373,8 +373,7 @@ HTML_TEMPLATE = """
                     var fullTrialRun = !restrictTrials || uids.length >= allUids.length;
                     return Promise.all(uids.map(function(uid) {
                         return fetchAccountTrial(uid, null, {
-                            skipAutoRefetch: true,
-                            skipNoAccountPrompt: true
+                            skipAutoRefetch: true
                         });
                     })).then(function() {
                         if (fullTrialRun) uiLog('已刷新各账号体验剩余时间');
@@ -477,7 +476,7 @@ HTML_TEMPLATE = """
         function fetchAccountTrial(uid, btnEl, opts) {
             opts = opts || {};
             const skipAutoRefetch = !!opts.skipAutoRefetch;
-            const skipNoAccountPrompt = !!opts.skipNoAccountPrompt;
+            const skipNoAccountRefetch = !!opts.skipNoAccountRefetch;
             const el = document.getElementById(trialDomId(uid));
             if (!el) return Promise.resolve();
             if (btnEl) { btnEl.disabled = true; }
@@ -495,36 +494,36 @@ HTML_TEMPLATE = """
                         return;
                     }
                     if (data.no_account) {
-                        uiLog('查体验时长[' + uid + ']: 体验侧无 expireTime（no_account）');
+                        uiLog('查体验时长[' + uid + ']: 体验侧无 expireTime（no_account），服务端已暂从 /v1 轮询排除该账号 OC');
                         var card = el.closest('.account-card');
                         var isDefCard = card && card.getAttribute('data-is-default') === '1';
-                        var hasRefetchAlready = card && card.querySelector('.account-refetch');
-                        var extra = !hasRefetchAlready ? refetchOcBlockHtml(true, uid) : '';
-                        el.innerHTML = trialNoExpireHtml({ isDefault: isDefCard }) + extra;
-                        var cfm = isDefCard
-                            ? '该账号在体验接口侧暂无到期信息（未返回 expireTime）。是否经 Claw 创建实例并尝试拉取 OC？'
-                            : '将使用本账号凭证连接 Claw（与终端「当前用户」一致）。是否尝试创建/拉取 OC？';
-                        if (!skipNoAccountPrompt && confirm(cfm)) {
-                            return fetch('/api/claw_refetch_oc', {
-                                method: 'POST',
-                                headers: { 'Content-Type': 'application/json' },
-                                body: JSON.stringify({ user_id: uid })
-                            })
-                                .then(function(r) { return r.json(); })
-                                .then(function(rd) {
-                                    if (rd.success) {
-                                        userAlert('创建并拉取 OC：' + (rd.message || '完成'));
-                                    } else {
-                                        userAlert('创建/拉取失败：' + (rd.error || '未知错误'));
-                                    }
-                                    return refreshAccountsHealth({ light: true, trialsOnlyUids: [String(uid)] }).then(function() {
-                                        loadOcCatalog();
-                                        return fetchAccountTrial(uid, null, { skipAutoRefetch: true });
-                                    });
-                                })
-                                .catch(function(e) { userAlert(String(e)); });
+                        if (skipNoAccountRefetch || skipAutoRefetch) {
+                            el.innerHTML = trialNoExpireHtml({ isDefault: isDefCard });
+                            return;
                         }
-                        return;
+                        el.innerHTML = '<span class="trial-muted">体验侧无到期时间，自动经 Claw 拉取 OC…</span>';
+                        return fetch('/api/claw_refetch_oc', {
+                            method: 'POST',
+                            headers: { 'Content-Type': 'application/json' },
+                            body: JSON.stringify({ user_id: uid })
+                        })
+                            .then(function(r) { return r.json(); })
+                            .then(function(rd) {
+                                if (rd.success) {
+                                    uiLog('体验侧无到期时间 → 自动拉取 OC 成功[' + uid + ']');
+                                } else {
+                                    uiLog('体验侧无到期时间 → 自动拉取 OC 失败[' + uid + ']: ' + (rd.error || ''));
+                                    userAlert('自动拉取 OC 失败：' + (rd.error || '未知错误'));
+                                }
+                                return refreshAccountsHealth({ light: true, trialsOnlyUids: [String(uid)] }).then(function() {
+                                    loadOcCatalog();
+                                    return fetchAccountTrial(uid, null, { skipAutoRefetch: true, skipNoAccountRefetch: true });
+                                });
+                            })
+                            .catch(function(e) {
+                                uiLog('自动拉取 OC 异常[' + uid + ']: ' + String(e));
+                                userAlert(String(e));
+                            });
                     }
                     if (!data.ok) {
                         const errMsg = data.message || '未知错误';
@@ -685,8 +684,11 @@ HTML_TEMPLATE = """
                         var head = '<div class="oc-relay-head"><span>账号</span><span>OC 预览 · 写入时间</span><span>体验剩余</span></div>';
                         listEl.innerHTML = head + rows.map(function(row) {
                             var def = row.is_default ? '<span class="oc-def-badge">✦ 默认账号</span>' : '';
+                            var excl = row.excluded_from_relay
+                                ? '<div class="trial-muted" style="margin-top:4px;font-size:0.76rem;color:#b71c1c;">暂不参与 /v1 轮询（体验无到期时间；拉取 OC 成功后可恢复）</div>'
+                                : '';
                             return '<div class="oc-relay-row">'
-                                + '<div><div class="oc-account-title">' + escapeHtml(row.title || row.uid || '') + '</div>' + def + '</div>'
+                                + '<div><div class="oc-account-title">' + escapeHtml(row.title || row.uid || '') + '</div>' + def + excl + '</div>'
                                 + '<div><code>' + escapeHtml(row.preview || '') + '</code><div class="trial-muted" style="margin-top:6px;font-size:0.78rem;">写入 ' + escapeHtml(row.saved_at || '—') + '</div></div>'
                                 + '<div>' + trialHtmlFromRelay(row.trial, row) + '</div>'
                                 + '</div>';
@@ -1241,23 +1243,31 @@ def persist_oc_to_user_panel(panel_uid, key):
 def build_relay_oc_pool():
     """
     收集可用于 /v1 转发的 OC：各账号 user 文件中的 mimo_api_key（去重）+ 全局 current_api_key（若尚未出现在池中）。
+    体验接口返回「无 expireTime」时会在该账号上置 mimo_trial_no_expire，本池**不包含**该账号的 OC，避免 401。
     返回 [(panel_uid, oc_key), ...]，panel_uid 为面板 users 键或 default 对应键。
     """
     sync_mimo_key_from_app_state()
     pool = []
     seen = set()
     users_data = load_users()
-    for rk, u in users_data.get("users", {}).items():
+    users = users_data.get("users", {})
+    for rk, u in users.items():
+        if u.get("mimo_trial_no_expire"):
+            continue
         k = (u.get("mimo_api_key") or "").strip()
         if k and validate_key(k) and k not in seen:
             pool.append((str(rk), k))
             seen.add(k)
     gk = (mimo_api_key or "").strip()
     if gk and validate_key(gk) and gk not in seen:
-        du = resolve_user_key(users_data.get("users", {}), users_data.get("default"))
+        du = resolve_user_key(users, users_data.get("default"))
         tag = du if du else "default"
-        pool.append((tag, gk))
-        seen.add(gk)
+        u_def = users.get(du) if du else None
+        if u_def and u_def.get("mimo_trial_no_expire"):
+            pass
+        else:
+            pool.append((tag, gk))
+            seen.add(gk)
     return pool
 
 
@@ -1305,6 +1315,12 @@ def pick_relay_oc_round_robin():
     pool = build_relay_oc_pool()
     if not pool:
         sync_mimo_key_from_app_state()
+        users_data = load_users()
+        users = users_data.get("users", {})
+        du = resolve_user_key(users, users_data.get("default"))
+        u_def = users.get(du) if du else None
+        if u_def and u_def.get("mimo_trial_no_expire"):
+            return None, None
         if mimo_api_key and validate_key(mimo_api_key):
             return None, mimo_api_key
         return None, None
@@ -1817,6 +1833,16 @@ def api_account_trial():
         return jsonify({'success': False, 'error': '用户不存在'}), 400
     user = users_data['users'][uid]
     ex = fetch_mimo_claw_experience(user)
+    if ex.get("ok") and ex.get("no_account"):
+        user["mimo_trial_no_expire"] = True
+        save_users(users_data)
+        log_message(
+            f"账号 {uid} 体验侧无 expireTime（no_account），已暂从 /v1 轮询池排除；将依赖前端自动经 Claw 重拉 OC"
+        )
+    elif ex.get("ok") and not ex.get("no_account"):
+        if user.get("mimo_trial_no_expire"):
+            user.pop("mimo_trial_no_expire", None)
+            save_users(users_data)
     out = {'success': True}
     out.update(ex)
     # 默认账号的体验到期时间写入状态，供本地调度与 key_monitor 使用（手动刷新 OC 不会重置该时间）
@@ -1923,6 +1949,7 @@ def _relay_catalog_entry_from_row(row, def_uid):
         "saved_at": saved_at,
         "trial": trial,
         "uses_global_fallback": bool(row.get("uses_global_fallback")),
+        "excluded_from_relay": bool(u.get("mimo_trial_no_expire")),
     }
 
 
@@ -1997,7 +2024,7 @@ def api_claw_refetch_oc():
     """会话 401 等场景：通过 Claw 重新拉取 OC（拉取后必须再通过聊天探测）。
     可选 JSON：user_id 为面板账号键，指定用哪张卡的凭证连 Claw；省略则沿用当前 active_user。
     """
-    global last_refresh_error
+    global last_refresh_error, active_user
     try:
         sync_mimo_key_from_app_state()
         data = request.get_json(silent=True) or {}
@@ -2011,6 +2038,11 @@ def api_claw_refetch_oc():
         if not force_refresh_mimo_key_via_claw(uid_pref=uid):
             err = last_refresh_error or "拉取失败"
             return jsonify({"success": False, "error": err})
+        users_data = load_users()
+        clear_u = uid or active_user
+        if clear_u and clear_u in users_data.get("users", {}):
+            users_data["users"][clear_u].pop("mimo_trial_no_expire", None)
+            save_users(users_data)
         return jsonify(
             {
                 "success": True,
