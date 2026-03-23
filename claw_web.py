@@ -379,7 +379,7 @@ HTML_TEMPLATE = """
                     var fullTrialRun = !restrictTrials || uids.length >= allUids.length;
                     return Promise.all(uids.map(function(uid) {
                         return fetchAccountTrial(uid, null, {
-                            skipAutoRefetch: true
+                            skipAutoRefetch: false
                         });
                     })).then(function() {
                         if (fullTrialRun) uiLog('已刷新各账号体验剩余时间');
@@ -1270,7 +1270,7 @@ def persist_oc_to_user_panel(panel_uid, key):
 def build_relay_oc_pool():
     """
     收集可用于 /v1 转发的 OC：各账号 user 文件中的 mimo_api_key（去重）+ 全局 current_api_key（若尚未出现在池中）。
-    体验接口返回「无 expireTime」时会在该账号上置 mimo_trial_no_expire，本池**不包含**该账号的 OC，避免 401。
+    mimo_trial_no_expire 标记仅由 api_claw_refetch_oc 成功后清除，不再由 api_account_trial 设置。
     返回 [(panel_uid, oc_key), ...]，panel_uid 为面板 users 键或 default 对应键。
     """
     sync_mimo_key_from_app_state()
@@ -1914,13 +1914,8 @@ def api_account_trial():
         return jsonify({'success': False, 'error': '用户不存在'}), 400
     user = users_data['users'][uid]
     ex = fetch_mimo_claw_experience(user)
-    if ex.get("ok") and ex.get("no_account"):
-        user["mimo_trial_no_expire"] = True
-        save_users(users_data)
-        log_message(
-            f"账号 {uid} 体验侧无 expireTime（no_account），已暂从 /v1 轮询池排除；将依赖前端自动经 Claw 重拉 OC"
-        )
-    elif ex.get("ok") and not ex.get("no_account"):
+    # no_account 不再设置永久性标记，避免账号被永远排除出轮询池
+    if ex.get("ok") and not ex.get("no_account"):
         if user.get("mimo_trial_no_expire"):
             user.pop("mimo_trial_no_expire", None)
             save_users(users_data)
