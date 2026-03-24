@@ -16,6 +16,7 @@ from flask import Flask, render_template_string, request, jsonify, Response, g, 
 from urllib.parse import quote
 import sys
 import re
+import random as _random
 
 # 导入现有模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -57,6 +58,39 @@ _relay_rr_lock = threading.Lock()
 _relay_rr_idx = 0
 # Claw 拉 OC 依赖全局 client/密钥，多请求并发会互相践踏，必须串行
 _claw_refresh_lock = threading.Lock()
+# 401 blacklist: key -> blacklist timestamp. Blacklisted OCs excluded from pool for 5 min.
+_oc_blacklist = {}
+_oc_blacklist_lock = threading.Lock()
+OC_BLACKLIST_TTL = 300  # 5 minutes
+
+
+def _blacklist_oc(key, reason="401"):
+    if not key:
+        return
+    with _oc_blacklist_lock:
+        _oc_blacklist[key] = time.time()
+    log_message(f"OC {oc_key_preview(key)} blacklisted({reason}), excluded for {OC_BLACKLIST_TTL}s")
+
+
+def _is_oc_blacklisted(key):
+    if not key:
+        return False
+    with _oc_blacklist_lock:
+        ts = _oc_blacklist.get(key)
+        if ts is None:
+            return False
+        if time.time() - ts > OC_BLACKLIST_TTL:
+            del _oc_blacklist[key]
+            return False
+        return True
+
+
+def _clear_oc_blacklist(key):
+    if not key:
+        return
+    with _oc_blacklist_lock:
+        _oc_blacklist.pop(key, None)
+
 
 OPENAI_BASE_URL = "https://api.openai.com"
 
@@ -1295,6 +1329,8 @@ def build_relay_oc_pool():
         else:
             pool.append((tag, gk))
             seen.add(gk)
+    # Exclude blacklisted keys
+    pool = [(rk, k) for rk, k in pool if not _is_oc_blacklisted(k)]
     return pool
 
 
@@ -1337,8 +1373,7 @@ def iter_relay_oc_display_rows():
 
 
 def pick_relay_oc_round_robin(skip=None):
-    """轮询返回 (panel_uid, oc_key)；skip=set() 跳过已试过的key。无可用时 (None, None)。"""
-    global _relay_rr_idx
+    """随机返回 (panel_uid, oc_key)；skip=set() 跳过已试过的key。无可用时 (None, None)。"""
     pool = build_relay_oc_pool()
     if not pool:
         sync_mimo_key_from_app_state()
@@ -1351,16 +1386,15 @@ def pick_relay_oc_round_robin(skip=None):
         if mimo_api_key and validate_key(mimo_api_key):
             if skip and mimo_api_key in skip:
                 return None, None
+            if _is_oc_blacklisted(mimo_api_key):
+                return None, None
             return None, mimo_api_key
         return None, None
     if skip:
         pool = [(rk, k) for rk, k in pool if k not in skip]
     if not pool:
         return None, None
-    with _relay_rr_lock:
-        i = _relay_rr_idx % len(pool)
-        _relay_rr_idx += 1
-        return pool[i]
+    return _random.choice(pool)
 
 
 def _background_refresh_oc(rk):
@@ -1396,6 +1430,8 @@ def _retry_on_401(request, send_func):
 
         if resp.status_code == 401:
             log_message(f"OC {rk} 返回401，换下一个（{attempt+1}/{max_retry}）")
+            if k:
+                _blacklist_oc(k)
             if rk:
                 _background_refresh_oc(rk)
             continue
@@ -1594,6 +1630,7 @@ def _force_refresh_mimo_key_via_claw_inner(retry=True, uid_pref=None):
                 last_key_refresh = current_time
                 persist_mimo_key_to_app_state()
                 persist_oc_to_user_panel(rk_or_err, mimo_api_key)
+                _clear_oc_blacklist(new_key)
                 log_message(f"成功刷新MIMO API密钥: {new_key[:10]}...")
                 return True
             log_message("未找到新的MIMO_API_KEY")
