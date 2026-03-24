@@ -58,29 +58,34 @@ _relay_rr_lock = threading.Lock()
 _relay_rr_idx = 0
 # Claw 拉 OC 依赖全局 client/密钥，多请求并发会互相践踏，必须串行
 _claw_refresh_lock = threading.Lock()
-# 401 blacklist: key -> blacklist timestamp. Blacklisted OCs excluded from pool for 5 min.
+# 401 blacklist: key -> True. Blacklisted OCs excluded from pool until Claw successfully refreshes.
 _oc_blacklist = {}
 _oc_blacklist_lock = threading.Lock()
-OC_BLACKLIST_TTL = 300  # 5 minutes
 
 
 def _blacklist_oc(key, reason="401"):
     if not key:
         return
     with _oc_blacklist_lock:
-        _oc_blacklist[key] = time.time()
-    log_message(f"OC {oc_key_preview(key)} blacklisted({reason}), excluded for {OC_BLACKLIST_TTL}s")
+        _oc_blacklist[key] = True
+    log_message(f"OC {oc_key_preview(key)} blacklisted({reason}), excluded until Claw refreshes new key")
 
 
 def _is_oc_blacklisted(key):
     if not key:
         return False
     with _oc_blacklist_lock:
-        ts = _oc_blacklist.get(key)
-        if ts is None:
+        val = _oc_blacklist.get(key)
+        if val is None:
             return False
-        if time.time() - ts > OC_BLACKLIST_TTL:
-            del _oc_blacklist[key]
+        # 兼容旧格式 True（永久），以及新格式 expire_at 时间戳
+        if val is True:
+            return True
+        if isinstance(val, (int, float)):
+            if time.time() < val:
+                return True
+            # 已过期，移除
+            _oc_blacklist.pop(key, None)
             return False
         return True
 
@@ -90,6 +95,16 @@ def _clear_oc_blacklist(key):
         return
     with _oc_blacklist_lock:
         _oc_blacklist.pop(key, None)
+
+
+def _extend_oc_blacklist(key, duration=1800):
+    """延长黑名单时间（默认 30 分钟）。Claw 重拉失败时调用，避免频繁重试坏 key。"""
+    if not key:
+        return
+    expire_at = time.time() + duration
+    with _oc_blacklist_lock:
+        _oc_blacklist[key] = expire_at
+    log_message(f"OC {oc_key_preview(key)} 黑名单延长至 {duration // 60} 分钟")
 
 
 OPENAI_BASE_URL = "https://api.openai.com"
@@ -727,9 +742,15 @@ HTML_TEMPLATE = """
                             var excl = row.excluded_from_relay
                                 ? '<div class="trial-muted" style="margin-top:4px;font-size:0.76rem;color:#b71c1c;">暂不参与 /v1 轮询（体验无到期时间；拉取 OC 成功后可恢复）</div>'
                                 : '';
+                            var ocStatusHtml = '';
+                            if (row.oc_expired === true) {
+                                ocStatusHtml = ' <span style="display:inline-block;margin-left:6px;font-size:0.72rem;padding:2px 8px;border-radius:999px;background:#ffcdd2;color:#b71c1c;font-weight:700;">已过期</span>';
+                            } else if (row.oc_expired === false) {
+                                ocStatusHtml = ' <span style="display:inline-block;margin-left:6px;font-size:0.72rem;padding:2px 8px;border-radius:999px;background:#c8e6c9;color:#2e7d32;font-weight:700;">有效</span>';
+                            }
                             return '<div class="oc-relay-row">'
                                 + '<div><div class="oc-account-title">' + escapeHtml(row.title || row.uid || '') + '</div>' + def + excl + '</div>'
-                                + '<div><code>' + escapeHtml(row.preview || '') + '</code><div class="trial-muted" style="margin-top:6px;font-size:0.78rem;">写入 ' + escapeHtml(row.saved_at || '—') + '</div></div>'
+                                + '<div><code>' + escapeHtml(row.preview || '') + '</code><div class="trial-muted" style="margin-top:6px;font-size:0.78rem;">写入 ' + escapeHtml(row.saved_at || '—') + ocStatusHtml + '</div></div>'
                                 + '<div>' + trialHtmlFromRelay(row.trial, row) + '</div>'
                                 + '</div>';
                         }).join('');
@@ -879,18 +900,28 @@ def log_message(msg):
         logs.pop(0)
     print(line, file=sys.stderr)
 
-def transform_openai_request(openai_request):
+def transform_openai_request(openai_request, oc_key=None):
     """将OpenAI请求转换为MIMO请求（优先使用本轮轮询选中的 relay_oc_key）。"""
     raw = openai_request.get_json()
     data = dict(raw) if isinstance(raw, dict) else {}
     apply_model_mapping(data)
-    key = getattr(g, "relay_oc_key", None) or mimo_api_key
+    key = oc_key or getattr(g, "relay_oc_key", None)
+    if not key:
+        return data, None
     headers = build_mimo_json_headers(key)
     return data, headers
 
 def transform_openai_response(mimo_response):
     """将MIMO响应转换为OpenAI格式"""
     return transform_mimo_response_json(mimo_response)
+
+
+def _make_401_response(mimo_resp):
+    """从 MIMO 401 响应构造统一的 401 Response 对象。"""
+    body = mimo_resp.content
+    ct = mimo_resp.headers.get("content-type", "application/json")
+    mimo_resp.close()
+    return Response(body, status=401, content_type=ct)
 
 
 def _mimo_chat_stream_response(openai_request, data, headers):
@@ -910,7 +941,7 @@ def _mimo_chat_stream_response(openai_request, data, headers):
             rk2, k2 = pick_relay_oc_round_robin()
             g.relay_oc_rk = rk2
             g.relay_oc_key = k2 or mimo_api_key
-            data, headers = transform_openai_request(openai_request)
+            data, headers = transform_openai_request(openai_request, k2)
             r = requests.post(url, json=data, headers=headers, timeout=120, stream=True)
         else:
             return Response(body401, status=401, content_type=ct401)
@@ -1319,6 +1350,7 @@ def build_relay_oc_pool():
         if k and validate_key(k) and k not in seen:
             pool.append((str(rk), k))
             seen.add(k)
+
     gk = (mimo_api_key or "").strip()
     if gk and validate_key(gk) and gk not in seen:
         du = resolve_user_key(users, users_data.get("default"))
@@ -1329,6 +1361,7 @@ def build_relay_oc_pool():
         else:
             pool.append((tag, gk))
             seen.add(gk)
+
     # Exclude blacklisted keys
     pool = [(rk, k) for rk, k in pool if not _is_oc_blacklisted(k)]
     return pool
@@ -1358,6 +1391,7 @@ def iter_relay_oc_display_rows():
         elif panel_uid == def_uid and gk and validate_key(gk):
             oc_key = gk
             uses_global_fallback = True
+
         if not oc_key:
             continue
         saved_at = (u.get("mimo_api_key_saved_at") or "").strip()
@@ -1620,18 +1654,17 @@ def _force_refresh_mimo_key_via_claw_inner(retry=True, uid_pref=None):
             content = reply_read.strip()
             new_key = extract_mimo_key(content)
             if new_key:
-                mimo_api_key = new_key
-                vp = probe_mimo_oc_via_api()
+                vp = probe_mimo_oc_via_api_key(new_key)
                 if vp is not True:
                     last_refresh_error = "拉取到的 OC 未通过聊天接口校验（可能密钥无效或接口异常）"
                     log_message(last_refresh_error)
-                    sync_mimo_key_from_app_state()
                     return False
-                last_key_refresh = current_time
+                mimo_api_key = new_key
                 persist_mimo_key_to_app_state()
-                persist_oc_to_user_panel(rk_or_err, mimo_api_key)
+                persist_oc_to_user_panel(rk_or_err, new_key)
+                last_key_refresh = current_time
                 _clear_oc_blacklist(new_key)
-                log_message(f"成功刷新MIMO API密钥: {new_key[:10]}...")
+                log_message(f"成功刷新账号 {rk_or_err} 的 MIMO API密钥: {new_key[:10]}...")
                 return True
             log_message("未找到新的MIMO_API_KEY")
         else:
@@ -1652,30 +1685,42 @@ def _force_refresh_mimo_key_via_claw_inner(retry=True, uid_pref=None):
         if "client" in locals():
             client.close()
 
+    # Claw 重拉失败，延长该账号 OC 的黑名单时间，避免频繁重试坏 key
+    try:
+        ud = load_users()
+        u = ud.get("users", {}).get(rk_or_err) if rk_or_err else None
+        if u:
+            bad_key = (u.get("mimo_api_key") or "").strip()
+            if bad_key and validate_key(bad_key):
+                _extend_oc_blacklist(bad_key)
+    except Exception:
+        pass
     return False
 
 def refresh_key_if_needed(retry=True):
-    """
-    无有效 OC 时走 Claw 拉取；已有格式合法 OC 时不再按时间盲刷（失效由定时 API 探测与请求侧 401 处理）。
-    """
-    global mimo_api_key
-    if not mimo_api_key:
-        sync_mimo_key_from_app_state()
-    if not mimo_api_key or not validate_key(mimo_api_key):
-        return force_refresh_mimo_key_via_claw(retry=retry)
-    return True
-
-def ensure_openai_proxy_auth():
-    """与 claw_proxy 一致：同步密钥；若存在多账号 OC 池则可直接转发，否则尝试单次 Claw 拉取。"""
-    global mimo_api_key
-    if not mimo_api_key:
-        sync_mimo_key_from_app_state()
+    """确保至少一个账号有有效 OC。"""
     if build_relay_oc_pool():
         return True
-    if not mimo_api_key or not validate_key(mimo_api_key):
-        return refresh_key_if_needed()
-    return True
+    users_data = load_users()
+    users = users_data.get("users", {})
+    for rk, u in users.items():
+        k = (u.get("mimo_api_key") or "").strip()
+        if not k or not validate_key(k):
+            return force_refresh_mimo_key_via_claw(retry=retry, uid_pref=rk)
+    return False
 
+def ensure_openai_proxy_auth():
+    """确保多账号 OC 池可用。"""
+    if build_relay_oc_pool():
+        return True
+    users_data = load_users()
+    users = users_data.get("users", {})
+    for rk, u in users.items():
+        k = (u.get("mimo_api_key") or "").strip()
+        if not k or not validate_key(k):
+            if force_refresh_mimo_key_via_claw(uid_pref=rk):
+                break
+    return bool(build_relay_oc_pool())
 
 def verify_relay_client_authorization():
     """校验客户端对本机 /v1 的 Bearer（与 RELAY_CLIENT_API_KEY）；OPTIONS 跳过。"""
@@ -1951,6 +1996,13 @@ def api_account_trial():
         return jsonify({'success': False, 'error': '用户不存在'}), 400
     user = users_data['users'][uid]
     ex = fetch_mimo_claw_experience(user)
+    # 将体验数据写入本地缓存，供 /api/oc_catalog 使用
+    try:
+        ex_cache = dict(ex)
+        ex_cache["_cache_ts"] = time.time()
+        user["experience_cache"] = ex_cache
+    except Exception:
+        pass
     # no_account 不再设置永久性标记，避免账号被永远排除出轮询池
     if ex.get("ok") and not ex.get("no_account"):
         if user.get("mimo_trial_no_expire"):
@@ -1975,9 +2027,7 @@ def api_account_trial():
 
 @app.route('/api/account_copy_line', methods=['POST'])
 def api_account_copy_line():
-    """复制 MIMO OC。可传 user_id 复制该账号已保存的密钥；未传则复制当前全局中转密钥。
-    体验剩余（mimo-claw/status）与本地是否写入 mimo_api_key 无关；非默认账号若无本地 OC 但内存中有全局有效密钥，则回退为全局并写入该 user 文件。"""
-    sync_mimo_key_from_app_state()
+    """复制指定账号已保存的 OC。每个账号独立管理自己的 OC。"""
     data = request.get_json(silent=True) or {}
     raw_uid = data.get("user_id")
     users_data = load_users()
@@ -1989,32 +2039,13 @@ def api_account_copy_line():
         key = (u.get("mimo_api_key") or "").strip()
         if key and validate_key(key):
             return jsonify({"success": True, "line": key})
-        du = str(users_data.get("default", ""))
-        gk = (mimo_api_key or "").strip()
-        if rk == du:
-            if gk and validate_key(gk):
-                persist_oc_to_user_panel(rk, gk)
-                return jsonify({"success": True, "line": gk, "synced_from_global": True})
-        elif gk and validate_key(gk):
-            persist_oc_to_user_panel(rk, gk)
-            return jsonify({"success": True, "line": gk, "synced_from_global": True})
-        return jsonify(
-            {
-                "success": False,
-                "error": (
-                    "该账号 user 文件与内存中均无有效 OC。请先「重新申请 OC」（经 Claw）拉取，或确认本机 app_state 已有密钥。"
-                ),
-            }
-        ), 400
-    key = (mimo_api_key or "").strip()
-    if not key or not validate_key(key):
-        return jsonify(
-            {
-                "success": False,
-                "error": "暂无有效 OC，请先通过 Claw 拉取或「手动刷新 OC」",
-            }
-        ), 400
-    return jsonify({"success": True, "line": key})
+        return jsonify({"success": False, "error": "该账号暂无有效 OC，请先「重新申请 OC」拉取"}), 400
+    # 无 user_id：返回第一个有效 OC
+    for rk, u in users_data.get("users", {}).items():
+        key = (u.get("mimo_api_key") or "").strip()
+        if key and validate_key(key):
+            return jsonify({"success": True, "line": key})
+    return jsonify({"success": False, "error": "暂无有效 OC，请先通过 Claw 拉取"}), 400
 
 
 @app.route('/api/status')
@@ -2044,16 +2075,54 @@ def api_status():
     })
 
 
-def _relay_catalog_entry_from_row(row, def_uid):
+def _check_oc_expired(saved_at):
+    """检查 OC 是否过期（有效期 1 小时）。返回 True=已过期, False=有效, None=未知。"""
+    if not saved_at or saved_at == "—":
+        return None
+    try:
+        from datetime import datetime
+        dt = datetime.strptime(saved_at.strip(), "%Y-%m-%d %H:%M:%S")
+        elapsed = time.time() - dt.timestamp()
+        return elapsed > 3600
+    except Exception:
+        return None
+
+
+def _relay_catalog_entry_from_row(row, def_uid, skip_trial=False):
     u = row["user"]
     oc_key = row["oc_key"]
-    saved_at = (row.get("saved_at") or "").strip() or "—"
+    saved_at_raw = (row.get("saved_at") or "").strip()
+    saved_at = saved_at_raw or "—"
+    oc_expired = _check_oc_expired(saved_at_raw)
     panel_uid = row["uid"]
     title = f"{u.get('name') or '未命名'} · {u.get('userId') or ''}"
     if row.get("uses_global_fallback"):
         title += "（OC 来自全局）"
     is_def = str(panel_uid) == def_uid
-    trial = fetch_mimo_claw_experience(u)
+
+    if skip_trial:
+        trial = None
+    else:
+        # 优先使用本地缓存的体验数据（5 分钟内有效），避免每次请求小米 API
+        cached_exp = u.get("experience_cache")
+        now_ts = time.time()
+        if (cached_exp and isinstance(cached_exp, dict)
+                and cached_exp.get("_cache_ts")
+                and now_ts - cached_exp.get("_cache_ts", 0) < 300):
+            trial = cached_exp
+        else:
+            trial = fetch_mimo_claw_experience(u)
+            # 写入缓存
+            trial_to_cache = dict(trial)
+            trial_to_cache["_cache_ts"] = now_ts
+            u["experience_cache"] = trial_to_cache
+            try:
+                users_data = load_users()
+                if panel_uid in users_data.get("users", {}):
+                    users_data["users"][panel_uid]["experience_cache"] = trial_to_cache
+                    save_users(users_data)
+            except Exception:
+                pass
     return {
         "uid": str(panel_uid),
         "title": title,
@@ -2062,10 +2131,41 @@ def _relay_catalog_entry_from_row(row, def_uid):
         "is_default": is_def,
         "preview": oc_key_preview(oc_key),
         "saved_at": saved_at,
+        "oc_expired": oc_expired,
         "trial": trial,
         "uses_global_fallback": bool(row.get("uses_global_fallback")),
         "excluded_from_relay": bool(u.get("mimo_trial_no_expire")),
     }
+
+
+@app.route('/api/oc_trial')
+def api_oc_trial():
+    """返回单个账号的体验数据，供前端异步填充 oc_catalog 列表。"""
+    uid = request.args.get('uid', '')
+    users_data = load_users()
+    rk = resolve_user_key(users_data.get('users', {}), uid)
+    if not rk:
+        return jsonify({'ok': False, 'error': '用户不存在'}), 400
+    user = users_data['users'][rk]
+    # 优先使用缓存
+    cached_exp = user.get("experience_cache")
+    now_ts = time.time()
+    if (cached_exp and isinstance(cached_exp, dict)
+            and cached_exp.get("_cache_ts")
+            and now_ts - cached_exp.get("_cache_ts", 0) < 300):
+        trial = cached_exp
+    else:
+        trial = fetch_mimo_claw_experience(user)
+        trial_to_cache = dict(trial)
+        trial_to_cache["_cache_ts"] = now_ts
+        try:
+            user["experience_cache"] = trial_to_cache
+            save_users(users_data)
+        except Exception:
+            pass
+    saved_at_raw = (user.get("mimo_api_key_saved_at") or "").strip()
+    oc_expired = _check_oc_expired(saved_at_raw)
+    return jsonify({'uid': uid, 'trial': trial, 'oc_expired': oc_expired})
 
 
 @app.route('/api/oc_catalog')
@@ -2079,7 +2179,7 @@ def api_oc_catalog():
     else:
         max_workers = max(1, min(12, len(rows)))
         with ThreadPoolExecutor(max_workers=max_workers) as ex:
-            relay_entries = list(ex.map(lambda r: _relay_catalog_entry_from_row(r, def_uid), rows))
+            relay_entries = list(ex.map(lambda r: _relay_catalog_entry_from_row(r, def_uid, skip_trial=True), rows))
     pool = build_relay_oc_pool()
     hist = load_oc_history()
     return jsonify(
@@ -2437,18 +2537,15 @@ def openai_chat_completions():
 
     def send(oc_key):
         try:
-            data, headers = transform_openai_request(request)
+            data, headers = transform_openai_request(request, oc_key)
             log_message(f"转换后的模型: {data.get('model', 'unknown')}")
             log_message(f"聊天请求摘要: {json.dumps(chat_completion_log_summary(data), ensure_ascii=False)}")
 
             if data.get("stream"):
-                # 流式需要特殊处理，401时返回Response对象让外层判断
                 url = f"{MIMO_BASE_URL}/v1/chat/completions"
                 r = requests.post(url, json=data, headers=headers, timeout=120, stream=True)
                 if r.status_code == 401:
-                    r.close()
-                    return Response(r.content, status=401, content_type=r.headers.get('content-type', 'application/json'))
-                # 非401正常流式返回
+                    return _make_401_response(r)
                 ct = r.headers.get("content-type", "text/event-stream; charset=utf-8")
                 def gen():
                     try:
@@ -2464,7 +2561,7 @@ def openai_chat_completions():
                     json=data, headers=headers, timeout=120
                 )
                 if response.status_code == 401:
-                    return Response(response.content, status=401, content_type=response.headers.get('content-type', 'application/json'))
+                    return _make_401_response(response)
                 transformed_data = transform_openai_response(response)
                 return Response(
                     json.dumps(transformed_data),
@@ -2498,7 +2595,7 @@ def openai_list_models():
                 timeout=30
             )
             if response.status_code == 401:
-                return Response(response.content, status=401, content_type=response.headers.get('content-type', 'application/json'))
+                return _make_401_response(response)
             transformed_data = transform_openai_response(response)
             return Response(
                 json.dumps(transformed_data),
@@ -2553,7 +2650,7 @@ def openai_proxy_all(path):
                 )
 
             if response.status_code == 401:
-                return Response(response.content, status=401, content_type=response.headers.get('content-type', 'application/json'))
+                return _make_401_response(response)
 
             transformed_data = transform_openai_response(response)
 
