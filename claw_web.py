@@ -940,7 +940,7 @@ def _mimo_chat_stream_response(openai_request, data, headers):
         if force_refresh_mimo_key_via_claw(uid_pref=rr):
             rk2, k2 = pick_relay_oc_round_robin()
             g.relay_oc_rk = rk2
-            g.relay_oc_key = k2 or mimo_api_key
+            g.relay_oc_key = k2
             data, headers = transform_openai_request(openai_request, k2)
             r = requests.post(url, json=data, headers=headers, timeout=120, stream=True)
         else:
@@ -1415,17 +1415,6 @@ def pick_relay_oc_round_robin(skip=None):
         users = users_data.get("users", {})
         du = resolve_user_key(users, users_data.get("default"))
         u_def = users.get(du) if du else None
-        if u_def and u_def.get("mimo_trial_no_expire"):
-            return None, None
-        if mimo_api_key and validate_key(mimo_api_key):
-            if skip and mimo_api_key in skip:
-                return None, None
-            if _is_oc_blacklisted(mimo_api_key):
-                return None, None
-            return None, mimo_api_key
-        return None, None
-    if skip:
-        pool = [(rk, k) for rk, k in pool if k not in skip]
     if not pool:
         return None, None
     return _random.choice(pool)
