@@ -676,41 +676,45 @@ async def openai_proxy_all(request: Request, path: str):
 
 
 async def key_monitor():
-    """后台监控：每30分钟检查OC，超过45分钟主动刷新"""
+    """后台监控：每5分钟检查OC，过期立即刷新"""
     while True:
-        await asyncio.sleep(30 * 60)  # 每30分钟检查一次
+        await asyncio.sleep(5 * 60)  # 每5分钟检查一次
         try:
             if not state.mimo_api_key:
                 await sync_mimo_key_from_app_state()
 
-            # 检查OC年龄，超过45分钟主动刷新
-            if state.oc_created_at and (time.time() - state.oc_created_at) > 45 * 60:
-                state.log("Monitor: OC 即将过期，主动刷新...")
+            # 检查所有OC，找出过期的
+            pool = await build_relay_oc_pool()
+            need_refresh = False
+
+            if not pool:
+                state.log("Monitor: 没有可用OC，主动获取...")
                 await force_refresh_mimo_key_via_claw()
                 continue
 
-            pool = await build_relay_oc_pool()
-            if not pool:
-                if state.mimo_api_key and validate_key(state.mimo_api_key):
-                    pool = [(None, state.mimo_api_key)]
-                else:
-                    # 没有可用OC，主动获取
-                    state.log("Monitor: 没有可用OC，主动获取...")
-                    await force_refresh_mimo_key_via_claw()
-                    continue
-
-            any_ok = False
             for rk, key in pool:
+                # 探测OC是否有效
                 probe = await probe_mimo_oc_via_api_key(key)
                 if probe is False:
-                    state.log(f"Monitor: account {rk} OC expired, refreshing...")
+                    state.log(f"Monitor: 账号 {rk} OC已过期，重新申请...")
                     await force_refresh_mimo_key_via_claw(uid_pref=rk)
-                elif probe is True:
-                    any_ok = True
+                    need_refresh = True
+                elif probe is None:
+                    # 探测失败，也重新申请
+                    state.log(f"Monitor: 账号 {rk} OC探测失败，重新申请...")
+                    await force_refresh_mimo_key_via_claw(uid_pref=rk)
+                    need_refresh = True
 
-            if not any_ok:
-                state.log("Monitor: 所有OC都失效，主动刷新...")
-                await force_refresh_mimo_key_via_claw()
+            if not need_refresh:
+                # 检查OC创建时间（内存中）
+                if state.oc_created_at:
+                    age_minutes = (time.time() - state.oc_created_at) / 60
+                    if age_minutes > 50:
+                        state.log(
+                            f"Monitor: OC已创建 {age_minutes:.0f} 分钟，主动刷新..."
+                        )
+                        await force_refresh_mimo_key_via_claw()
+
         except asyncio.CancelledError:
             break
         except Exception as e:
