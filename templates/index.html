@@ -1,0 +1,323 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <title>MiMo 控制台</title>
+    <meta charset="utf-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1">
+    <link rel="stylesheet" href="/static/style.css">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/remixicon@4.1.0/fonts/remixicon.css">
+</head>
+<body>
+<div class="app">
+    <!-- 侧边栏 -->
+    <aside class="sidebar">
+        <div class="sidebar-header">
+            <div class="logo">
+                <i class="ri-robot-2-fill"></i>
+                <span>MiMo</span>
+            </div>
+            <div class="version">FastAPI</div>
+        </div>
+        <nav class="sidebar-nav">
+            <a href="#" class="nav-item active" data-tab="overview">
+                <i class="ri-dashboard-3-line"></i>
+                <span>概览</span>
+            </a>
+            <a href="#" class="nav-item" data-tab="users">
+                <i class="ri-user-3-line"></i>
+                <span>用户管理</span>
+            </a>
+            <a href="#" class="nav-item" data-tab="relay">
+                <i class="ri-key-2-line"></i>
+                <span>OC 中转</span>
+            </a>
+            <a href="#" class="nav-item" data-tab="tokens">
+                <i class="ri-bar-chart-grouped-line"></i>
+                <span>Token 统计</span>
+            </a>
+            <a href="#" class="nav-item" data-tab="logs">
+                <i class="ri-terminal-box-line"></i>
+                <span>日志</span>
+            </a>
+            <a href="#" class="nav-item" data-tab="settings">
+                <i class="ri-settings-3-line"></i>
+                <span>设置</span>
+            </a>
+        </nav>
+        <div class="sidebar-footer">
+            <div class="status-dot" id="statusDot"></div>
+            <span id="statusText">运行中</span>
+        </div>
+    </aside>
+
+    <!-- 主内容区 -->
+    <main class="main">
+        <!-- 概览页 -->
+        <section class="tab-content active" id="tab-overview">
+            <div class="page-header">
+                <h1>概览</h1>
+                <button class="btn-primary" onclick="manualRefresh()">
+                    <i class="ri-refresh-line"></i> 刷新 OC
+                </button>
+            </div>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon green"><i class="ri-user-3-fill"></i></div>
+                    <div class="stat-info">
+                        <div class="stat-value" id="statAccounts">0</div>
+                        <div class="stat-label">账号数</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon blue"><i class="ri-key-2-fill"></i></div>
+                    <div class="stat-info">
+                        <div class="stat-value" id="statOCs">0</div>
+                        <div class="stat-label">可用 OC</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon purple"><i class="ri-time-fill"></i></div>
+                    <div class="stat-info">
+                        <div class="stat-value" id="statNextCheck">--</div>
+                        <div class="stat-label">下次检查</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon orange"><i class="ri-file-text-fill"></i></div>
+                    <div class="stat-info">
+                        <div class="stat-value" id="statTokens">0</div>
+                        <div class="stat-label">Token 消耗</div>
+                    </div>
+                </div>
+            </div>
+
+            <div class="card">
+                <div class="card-header">
+                    <h2>账号状态</h2>
+                    <button class="btn-sm" onclick="refreshAccountsHealth()">
+                        <i class="ri-refresh-line"></i> 检测
+                    </button>
+                </div>
+                <div class="account-list" id="accountsList">
+                    <div class="empty-state">加载中...</div>
+                </div>
+            </div>
+        </section>
+
+        <!-- 用户管理页 -->
+        <section class="tab-content" id="tab-users">
+            <div class="page-header">
+                <h1>用户管理</h1>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <h2>批量导入</h2>
+                </div>
+                <div class="card-body">
+                    <textarea id="batchCredentials" rows="6" placeholder="支持 Netscape Cookie / CSV / JSON 格式，每行一个账号"></textarea>
+                    <button class="btn-primary" onclick="importCredentials()">
+                        <i class="ri-upload-2-line"></i> 批量导入
+                    </button>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <h2>账号列表</h2>
+                    <span class="badge" id="accountCount">0</span>
+                </div>
+                <div class="table-wrap">
+                    <table class="table" id="usersTable">
+                        <thead>
+                            <tr>
+                                <th>ID</th>
+                                <th>名称</th>
+                                <th>用户ID</th>
+                                <th>状态</th>
+                                <th>体验剩余</th>
+                                <th>操作</th>
+                            </tr>
+                        </thead>
+                        <tbody id="usersTableBody">
+                            <tr><td colspan="6" class="empty-state">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- OC 中转页 -->
+        <section class="tab-content" id="tab-relay">
+            <div class="page-header">
+                <h1>OC 中转</h1>
+                <button class="btn-primary" onclick="loadOcCatalog()">
+                    <i class="ri-refresh-line"></i> 刷新
+                </button>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <h2>轮询池</h2>
+                    <span class="meta" id="ocRelayMeta"></span>
+                </div>
+                <div class="table-wrap">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>账号</th>
+                                <th>OC 预览</th>
+                                <th>保存时间</th>
+                                <th>状态</th>
+                                <th>体验剩余</th>
+                            </tr>
+                        </thead>
+                        <tbody id="ocTableBody">
+                            <tr><td colspan="5" class="empty-state">加载中...</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <h2>历史 OC</h2>
+                </div>
+                <div class="history-list" id="ocHistoryList">
+                    <div class="empty-state">暂无历史</div>
+                </div>
+            </div>
+            <div class="card danger">
+                <div class="card-header">
+                    <h2>危险操作</h2>
+                </div>
+                <div class="card-body">
+                    <p class="text-muted">销毁当前 Claw 实例，所有数据将丢失。</p>
+                    <button class="btn-danger" onclick="destroyClaw()">
+                        <i class="ri-delete-bin-6-line"></i> 销毁 Claw 实例
+                    </button>
+                </div>
+            </div>
+        </section>
+
+        <!-- Token 统计页 -->
+        <section class="tab-content" id="tab-tokens">
+            <div class="page-header">
+                <h1>Token 统计</h1>
+                <button class="btn-primary" onclick="loadTokenStats()">
+                    <i class="ri-refresh-line"></i> 刷新
+                </button>
+            </div>
+            <div class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon blue"><i class="ri-arrow-up-circle-fill"></i></div>
+                    <div class="stat-info">
+                        <div class="stat-value" id="tokenInput">0</div>
+                        <div class="stat-label">输入 Token</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon green"><i class="ri-arrow-down-circle-fill"></i></div>
+                    <div class="stat-info">
+                        <div class="stat-value" id="tokenOutput">0</div>
+                        <div class="stat-label">输出 Token</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon purple"><i class="ri-database-2-fill"></i></div>
+                    <div class="stat-info">
+                        <div class="stat-value" id="tokenCache">0</div>
+                        <div class="stat-label">缓存 Token</div>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon orange"><i class="ri-calculator-fill"></i></div>
+                    <div class="stat-info">
+                        <div class="stat-value" id="tokenTotal">0</div>
+                        <div class="stat-label">总计 Token</div>
+                    </div>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <h2>请求记录</h2>
+                </div>
+                <div class="table-wrap">
+                    <table class="table">
+                        <thead>
+                            <tr>
+                                <th>时间</th>
+                                <th>模型</th>
+                                <th>输入</th>
+                                <th>输出</th>
+                                <th>缓存</th>
+                                <th>总计</th>
+                            </tr>
+                        </thead>
+                        <tbody id="tokenTableBody">
+                            <tr><td colspan="6" class="empty-state">暂无记录</td></tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+        </section>
+
+        <!-- 日志页 -->
+        <section class="tab-content" id="tab-logs">
+            <div class="page-header">
+                <h1>日志</h1>
+                <div class="page-actions">
+                    <button class="btn-sm" onclick="loadLogs()">
+                        <i class="ri-refresh-line"></i> 刷新
+                    </button>
+                    <button class="btn-sm btn-ghost" onclick="clearLogs()">
+                        <i class="ri-delete-bin-line"></i> 清空
+                    </button>
+                </div>
+            </div>
+            <div class="card">
+                <div class="log-terminal" id="logContainer">{{ logs }}</div>
+            </div>
+        </section>
+
+        <!-- 设置页 -->
+        <section class="tab-content" id="tab-settings">
+            <div class="page-header">
+                <h1>设置</h1>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <h2>OC 配置</h2>
+                </div>
+                <div class="card-body">
+                    <div class="form-group">
+                        <label>401 最大重试次数</label>
+                        <input type="number" id="ocMaxRetry" min="1" max="10" value="3">
+                    </div>
+                    <button class="btn-primary" onclick="saveOcMaxRetry()">
+                        <i class="ri-save-line"></i> 保存
+                    </button>
+                </div>
+            </div>
+            <div class="card">
+                <div class="card-header">
+                    <h2>API 信息</h2>
+                </div>
+                <div class="card-body">
+                    <div class="info-row">
+                        <span class="info-label">Chat Completions</span>
+                        <code>POST /v1/chat/completions</code>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Models</span>
+                        <code>GET /v1/models</code>
+                    </div>
+                    <div class="info-row">
+                        <span class="info-label">Base URL</span>
+                        <code>http://localhost:10060</code>
+                    </div>
+                </div>
+            </div>
+        </section>
+    </main>
+</div>
+
+<script src="/static/app.js"></script>
+</body>
+</html>
