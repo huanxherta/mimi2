@@ -1073,14 +1073,7 @@ def _check_oc_expired(saved_at: str) -> Optional[bool]:
 
         dt = datetime.strptime(saved_at.strip(), "%Y-%m-%d %H:%M:%S")
         elapsed = time.time() - dt.timestamp()
-        # OC 有效期约55分钟
-        # 超过50分钟视为即将过期
-        # 超过55分钟视为已过期
-        if elapsed > 55 * 60:
-            return True  # 已过期
-        if elapsed > 50 * 60:
-            return "expiring"  # 即将过期
-        return False  # 有效
+        return elapsed > 3600
     except Exception:
         return None
 
