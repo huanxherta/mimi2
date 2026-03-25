@@ -593,6 +593,7 @@ async def openai_chat_completions(request: Request):
                 td = r.json()
                 # 记录 token 使用量
                 usage = td.get("usage", {})
+                state.log(f"[Token] 响应 usage: {usage}")
                 if usage:
                     from web_core import log_token_usage
 
@@ -604,7 +605,10 @@ async def openai_chat_completions(request: Request):
                             "cached_tokens", 0
                         ),
                     )
-            except Exception:
+                else:
+                    state.log("[Token] 响应中无 usage 字段")
+            except Exception as e:
+                state.log(f"[Token] 解析异常: {e}")
                 td = r.text
             return JSONResponse(td, status_code=r.status_code)
 
