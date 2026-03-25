@@ -479,32 +479,6 @@ async def api_oc_catalog():
     }
 
 
-@app.get("/api/token_stats")
-async def api_token_stats():
-    """返回 Token 使用统计"""
-    import json
-
-    stats_file = os.path.join(BASE_DIR, "token_stats.json")
-    try:
-        with open(stats_file, "r", encoding="utf-8") as f:
-            data = json.load(f)
-    except Exception:
-        data = {"records": [], "total_input": 0, "total_output": 0, "total_cache": 0}
-
-    records = data.get("records", [])
-    total_input = sum(r.get("input", 0) for r in records)
-    total_output = sum(r.get("output", 0) for r in records)
-    total_cache = sum(r.get("cache", 0) for r in records)
-
-    return {
-        "records": records[-100:],  # 最近100条
-        "total_input": total_input,
-        "total_output": total_output,
-        "total_cache": total_cache,
-        "total_all": total_input + total_output + total_cache,
-    }
-
-
 # ──────────────────── OpenAI 中转路由 ────────────────────
 
 
@@ -591,24 +565,7 @@ async def openai_chat_completions(request: Request):
                 )
             try:
                 td = r.json()
-                # 记录 token 使用量
-                usage = td.get("usage", {})
-                state.log(f"[Token] 响应 usage: {usage}")
-                if usage:
-                    from web_core import log_token_usage
-
-                    await log_token_usage(
-                        model=data.get("model", "unknown"),
-                        input_tokens=usage.get("prompt_tokens", 0),
-                        output_tokens=usage.get("completion_tokens", 0),
-                        cache_tokens=usage.get("prompt_tokens_details", {}).get(
-                            "cached_tokens", 0
-                        ),
-                    )
-                else:
-                    state.log("[Token] 响应中无 usage 字段")
-            except Exception as e:
-                state.log(f"[Token] 解析异常: {e}")
+            except Exception:
                 td = r.text
             return JSONResponse(td, status_code=r.status_code)
 

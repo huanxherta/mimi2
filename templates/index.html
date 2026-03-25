@@ -31,10 +31,6 @@
                 <i class="ri-key-2-line"></i>
                 <span>OC 中转</span>
             </a>
-            <a href="#" class="nav-item" data-tab="tokens">
-                <i class="ri-bar-chart-grouped-line"></i>
-                <span>Token 统计</span>
-            </a>
             <a href="#" class="nav-item" data-tab="logs">
                 <i class="ri-terminal-box-line"></i>
                 <span>日志</span>
@@ -80,13 +76,6 @@
                     <div class="stat-info">
                         <div class="stat-value" id="statNextCheck">--</div>
                         <div class="stat-label">下次检查</div>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon orange"><i class="ri-file-text-fill"></i></div>
-                    <div class="stat-info">
-                        <div class="stat-value" id="statTokens">0</div>
-                        <div class="stat-label">Token 消耗</div>
                     </div>
                 </div>
             </div>
@@ -192,68 +181,6 @@
                     <button class="btn-danger" onclick="destroyClaw()">
                         <i class="ri-delete-bin-6-line"></i> 销毁 Claw 实例
                     </button>
-                </div>
-            </div>
-        </section>
-
-        <!-- Token 统计页 -->
-        <section class="tab-content" id="tab-tokens">
-            <div class="page-header">
-                <h1>Token 统计</h1>
-                <button class="btn-primary" onclick="loadTokenStats()">
-                    <i class="ri-refresh-line"></i> 刷新
-                </button>
-            </div>
-            <div class="stats-grid">
-                <div class="stat-card">
-                    <div class="stat-icon blue"><i class="ri-arrow-up-circle-fill"></i></div>
-                    <div class="stat-info">
-                        <div class="stat-value" id="tokenInput">0</div>
-                        <div class="stat-label">输入 Token</div>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon green"><i class="ri-arrow-down-circle-fill"></i></div>
-                    <div class="stat-info">
-                        <div class="stat-value" id="tokenOutput">0</div>
-                        <div class="stat-label">输出 Token</div>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon purple"><i class="ri-database-2-fill"></i></div>
-                    <div class="stat-info">
-                        <div class="stat-value" id="tokenCache">0</div>
-                        <div class="stat-label">缓存 Token</div>
-                    </div>
-                </div>
-                <div class="stat-card">
-                    <div class="stat-icon orange"><i class="ri-calculator-fill"></i></div>
-                    <div class="stat-info">
-                        <div class="stat-value" id="tokenTotal">0</div>
-                        <div class="stat-label">总计 Token</div>
-                    </div>
-                </div>
-            </div>
-            <div class="card">
-                <div class="card-header">
-                    <h2>请求记录</h2>
-                </div>
-                <div class="table-wrap">
-                    <table class="table">
-                        <thead>
-                            <tr>
-                                <th>时间</th>
-                                <th>模型</th>
-                                <th>输入</th>
-                                <th>输出</th>
-                                <th>缓存</th>
-                                <th>总计</th>
-                            </tr>
-                        </thead>
-                        <tbody id="tokenTableBody">
-                            <tr><td colspan="6" class="empty-state">暂无记录</td></tr>
-                        </tbody>
-                    </table>
                 </div>
             </div>
         </section>
