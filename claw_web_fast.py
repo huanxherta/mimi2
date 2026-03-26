@@ -526,6 +526,14 @@ async def openai_chat_completions(request: Request):
     async def send(oc_key, rk):
         raw = await request.json()
         data = dict(raw) if isinstance(raw, dict) else {}
+        # 清理空 content 消息
+        if "messages" in data and isinstance(data["messages"], list):
+            cleaned = []
+            for msg in data["messages"]:
+                if isinstance(msg, dict) and isinstance(msg.get("content"), list) and len(msg["content"]) == 0:
+                    continue
+                cleaned.append(msg)
+            data["messages"] = cleaned if cleaned else data["messages"]
         apply_model_mapping(data)
         headers = build_mimo_json_headers(oc_key)
         client = get_http_client()

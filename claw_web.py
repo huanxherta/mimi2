@@ -900,10 +900,30 @@ def log_message(msg):
         logs.pop(0)
     print(line, file=sys.stderr)
 
+def _clean_messages(messages):
+    """清理 messages：过滤空 content，避免小米 API 返回 400。"""
+    if not isinstance(messages, list):
+        return messages
+    cleaned = []
+    for msg in messages:
+        if not isinstance(msg, dict):
+            cleaned.append(msg)
+            continue
+        content = msg.get("content")
+        # 空数组 [] → 跳过该消息（通常是图片消息被过滤后的残留）
+        if isinstance(content, list) and len(content) == 0:
+            continue
+        cleaned.append(msg)
+    return cleaned if cleaned else messages  # 全被过滤则保留原样
+
+
 def transform_openai_request(openai_request, oc_key=None):
     """将OpenAI请求转换为MIMO请求（优先使用本轮轮询选中的 relay_oc_key）。"""
     raw = openai_request.get_json()
     data = dict(raw) if isinstance(raw, dict) else {}
+    # 清理空 content 消息
+    if "messages" in data:
+        data["messages"] = _clean_messages(data["messages"])
     apply_model_mapping(data)
     key = oc_key or getattr(g, "relay_oc_key", None)
     if not key:
