@@ -420,7 +420,16 @@ def chat_chunk_to_responses_event(
 
 # ──────────────────── FastAPI 路由 ────────────────────
 
-def create_responses_router(get_http_client, build_mimo_json_headers, apply_model_mapping, MIMO_BASE_URL):
+def create_responses_router(
+    get_http_client,
+    build_mimo_json_headers,
+    apply_model_mapping,
+    MIMO_BASE_URL,
+    verify_relay_client_authorization=None,
+    build_relay_oc_pool=None,
+    pick_relay_oc_round_robin=None,
+    retry_on_401=None,
+):
     """
     创建 FastAPI 路由，提供 /v1/responses 端点。
     需要传入依赖函数。
@@ -432,6 +441,14 @@ def create_responses_router(get_http_client, build_mimo_json_headers, apply_mode
     @router.post("/v1/responses")
     async def create_response(request: Request):
         """OpenAI Responses API 兼容端点，内部转换为 chat completions。"""
+        # 验证客户端 relay key
+        auth = request.headers.get("Authorization", "")
+        if verify_relay_client_authorization and not verify_relay_client_authorization(auth):
+            return JSONResponse(
+                {"error": {"message": "Invalid API key", "type": "authentication_error"}},
+                status_code=401,
+            )
+
         try:
             req_data = await request.json()
         except Exception:
@@ -448,115 +465,142 @@ def create_responses_router(get_http_client, build_mimo_json_headers, apply_mode
         chat_req = responses_to_chat_completion(req_data)
         apply_model_mapping(chat_req)
 
-        # 获取 API key（从 Authorization header）
-        auth = request.headers.get("Authorization", "")
-        api_key = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+        # 获取 OC pool key（和 chat completions 一样）
+        if build_relay_oc_pool and pick_relay_oc_round_robin:
+            if not await build_relay_oc_pool():
+                return JSONResponse(
+                    {"error": {"message": "MIMO API key unavailable", "type": "authentication_error"}},
+                    status_code=401,
+                )
+            oc_key = pick_relay_oc_round_robin()
+            if not oc_key:
+                return JSONResponse(
+                    {"error": {"message": "No available MIMO key", "type": "authentication_error"}},
+                    status_code=401,
+                )
+        else:
+            # 兼容旧调用方式
+            api_key = auth.replace("Bearer ", "") if auth.startswith("Bearer ") else ""
+            oc_key = api_key
 
-        headers = build_mimo_json_headers(api_key)
+        headers = build_mimo_json_headers(oc_key)
         url = f"{MIMO_BASE_URL}/v1/chat/completions"
 
         client = get_http_client()
 
-        if is_stream:
-            # 流式响应
-            async def stream_generator():
-                seq = 0
-                # 发送 response.created 事件
-                created_event = {
-                    "type": "response.created",
-                    "sequence_number": seq,
-                    "response": {
-                        "id": resp_id,
-                        "object": "response",
-                        "created_at": time.time(),
-                        "status": "in_progress",
-                        "model": model,
-                        "output": [],
-                        "usage": None
-                    }
-                }
-                yield f"event: response.created\ndata: {json.dumps(created_event, ensure_ascii=False)}\n\n"
-                seq += 1
+        async def _send_request(oc_key_inner=None):
+            """用指定 key 发送请求，支持 401 重试。"""
+            h = build_mimo_json_headers(oc_key_inner or oc_key)
+            if is_stream:
+                return await _do_stream(client, url, chat_req, h, resp_id, model)
+            else:
+                return await _do_nonstream(client, url, chat_req, h, resp_id, model)
 
-                # 发送 response.in_progress 事件
-                in_progress_event = {
-                    "type": "response.in_progress",
-                    "sequence_number": seq,
-                    "response": {
-                        "id": resp_id,
-                        "object": "response",
-                        "created_at": time.time(),
-                        "status": "in_progress",
-                        "model": model,
-                        "output": [],
-                        "usage": None
-                    }
-                }
-                yield f"event: response.in_progress\ndata: {json.dumps(in_progress_event, ensure_ascii=False)}\n\n"
-                seq += 1
-
-                try:
-                    async with client.stream("POST", url, json=chat_req, headers=headers, timeout=120) as resp:
-                        async for line in resp.aiter_lines():
-                            if not line.startswith("data: "):
-                                continue
-                            data_str = line[6:]
-                            if data_str.strip() == "[DONE]":
-                                break
-                            try:
-                                chunk = json.loads(data_str)
-                            except json.JSONDecodeError:
-                                continue
-
-                            sse = chat_chunk_to_responses_event(chunk, resp_id, seq)
-                            if sse:
-                                yield sse
-                                seq += 1
-
-                except Exception as e:
-                    error_event = {
-                        "type": "error",
-                        "sequence_number": seq,
-                        "code": "server_error",
-                        "message": str(e),
-                        "param": None
-                    }
-                    yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
-
-                # 发送 [DONE]
-                yield "data: [DONE]\n\n"
-
-            return StreamingResponse(
-                stream_generator(),
-                media_type="text/event-stream",
-                headers={
-                    "Cache-Control": "no-cache",
-                    "Connection": "keep-alive",
-                    "X-Accel-Buffering": "no"
-                }
-            )
+        if retry_on_401:
+            return await retry_on_401(_send_request)
         else:
-            # 非流式响应
+            return await _send_request()
+
+    async def _do_stream(client, url, chat_req, headers, resp_id, model):
+        """流式响应。"""
+        async def stream_generator():
+            seq = 0
+            # 发送 response.created 事件
+            created_event = {
+                "type": "response.created",
+                "sequence_number": seq,
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "created_at": time.time(),
+                    "status": "in_progress",
+                    "model": model,
+                    "output": [],
+                    "usage": None
+                }
+            }
+            yield f"event: response.created\ndata: {json.dumps(created_event, ensure_ascii=False)}\n\n"
+            seq += 1
+
+            # 发送 response.in_progress 事件
+            in_progress_event = {
+                "type": "response.in_progress",
+                "sequence_number": seq,
+                "response": {
+                    "id": resp_id,
+                    "object": "response",
+                    "created_at": time.time(),
+                    "status": "in_progress",
+                    "model": model,
+                    "output": [],
+                    "usage": None
+                }
+            }
+            yield f"event: response.in_progress\ndata: {json.dumps(in_progress_event, ensure_ascii=False)}\n\n"
+            seq += 1
+
             try:
-                resp = await client.post(url, json=chat_req, headers=headers, timeout=120)
-                chat_resp = resp.json()
+                async with client.stream("POST", url, json=chat_req, headers=headers, timeout=120) as resp:
+                    async for line in resp.aiter_lines():
+                        if not line.startswith("data: "):
+                            continue
+                        data_str = line[6:]
+                        if data_str.strip() == "[DONE]":
+                            break
+                        try:
+                            chunk = json.loads(data_str)
+                        except json.JSONDecodeError:
+                            continue
 
-                if resp.status_code != 200:
-                    # 透传错误
-                    return JSONResponse(chat_resp, status_code=resp.status_code)
+                        sse = chat_chunk_to_responses_event(chunk, resp_id, seq)
+                        if sse:
+                            yield sse
+                            seq += 1
 
-                responses_resp = chat_completion_to_responses(chat_resp, model, resp_id)
-                return JSONResponse(responses_resp)
-
-            except httpx.TimeoutException:
-                return JSONResponse(
-                    {"error": {"message": "Upstream timeout", "type": "server_error"}},
-                    status_code=504
-                )
             except Exception as e:
-                return JSONResponse(
-                    {"error": {"message": str(e), "type": "server_error"}},
-                    status_code=500
-                )
+                error_event = {
+                    "type": "error",
+                    "sequence_number": seq,
+                    "code": "server_error",
+                    "message": str(e),
+                    "param": None
+                }
+                yield f"event: error\ndata: {json.dumps(error_event, ensure_ascii=False)}\n\n"
+
+            # 发送 [DONE]
+            yield "data: [DONE]\n\n"
+
+        return StreamingResponse(
+            stream_generator(),
+            media_type="text/event-stream",
+            headers={
+                "Cache-Control": "no-cache",
+                "Connection": "keep-alive",
+                "X-Accel-Buffering": "no"
+            }
+        )
+
+    async def _do_nonstream(client, url, chat_req, headers, resp_id, model):
+        """非流式响应。"""
+        try:
+            resp = await client.post(url, json=chat_req, headers=headers, timeout=120)
+            chat_resp = resp.json()
+
+            if resp.status_code != 200:
+                return JSONResponse(chat_resp, status_code=resp.status_code)
+
+            responses_resp = chat_completion_to_responses(chat_resp, model, resp_id)
+            return JSONResponse(responses_resp)
+
+        except httpx.TimeoutException:
+            return JSONResponse(
+                {"error": {"message": "Upstream timeout", "type": "server_error"}},
+                status_code=504
+            )
+        except Exception as e:
+            return JSONResponse(
+                {"error": {"message": str(e), "type": "server_error"}},
+                status_code=500
+            )
 
     return router
