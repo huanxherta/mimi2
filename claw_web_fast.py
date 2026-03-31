@@ -57,6 +57,7 @@ from web_core import (
     chat_completion_log_summary,
 )
 from mimo_openai_shared import MIMO_BASE_URL as _MBU
+from mimi2_responses import create_responses_router
 
 
 # ──────────────────── 生命周期 ────────────────────
@@ -75,6 +76,15 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="MiMo Control Panel", lifespan=lifespan)
+
+# ──────────────────── Responses API 兼容层 ────────────────────
+responses_router = create_responses_router(
+    get_http_client=get_http_client,
+    build_mimo_json_headers=build_mimo_json_headers,
+    apply_model_mapping=apply_model_mapping,
+    MIMO_BASE_URL=MIMO_BASE_URL,
+)
+app.include_router(responses_router)
 
 # 静态文件和模板目录
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
