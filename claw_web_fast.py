@@ -83,6 +83,10 @@ responses_router = create_responses_router(
     build_mimo_json_headers=build_mimo_json_headers,
     apply_model_mapping=apply_model_mapping,
     MIMO_BASE_URL=MIMO_BASE_URL,
+    verify_relay_client_authorization=verify_relay_client_authorization,
+    build_relay_oc_pool=build_relay_oc_pool,
+    pick_relay_oc_round_robin=pick_relay_oc_round_robin,
+    retry_on_401=retry_on_401,
 )
 app.include_router(responses_router)
 
