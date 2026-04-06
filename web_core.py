@@ -17,6 +17,23 @@ from urllib.parse import quote
 
 import httpx
 
+# ── .env 文件加载（不依赖 python-dotenv）──
+_env_file = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.isfile(_env_file):
+    try:
+        with open(_env_file, "r", encoding="utf-8") as _f:
+            for _line in _f:
+                _line = _line.strip()
+                if not _line or _line.startswith("#") or "=" not in _line:
+                    continue
+                _k, _v = _line.split("=", 1)
+                _k = _k.strip()
+                _v = _v.strip().strip("'\"")
+                if _k and _k not in os.environ:
+                    os.environ[_k] = _v
+    except Exception:
+        pass
+
 # 复用原有模块
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import claw_chat as _claw_chat_mod

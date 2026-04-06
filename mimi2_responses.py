@@ -472,7 +472,8 @@ def create_responses_router(
                     {"error": {"message": "MIMO API key unavailable", "type": "authentication_error"}},
                     status_code=401,
                 )
-            oc_key = pick_relay_oc_round_robin()
+            _picked = await pick_relay_oc_round_robin()
+            oc_key = _picked[1] if _picked else None
             if not oc_key:
                 return JSONResponse(
                     {"error": {"message": "No available MIMO key", "type": "authentication_error"}},
@@ -488,9 +489,10 @@ def create_responses_router(
 
         client = get_http_client()
 
-        async def _send_request(oc_key_inner=None):
+        async def _send_request(oc_key_inner=None, rk=None):
             """用指定 key 发送请求，支持 401 重试。"""
-            h = build_mimo_json_headers(oc_key_inner or oc_key)
+            use_key = oc_key_inner if oc_key_inner else oc_key
+            h = build_mimo_json_headers(use_key)
             if is_stream:
                 return await _do_stream(client, url, chat_req, h, resp_id, model)
             else:
@@ -503,6 +505,23 @@ def create_responses_router(
 
     async def _do_stream(client, url, chat_req, headers, resp_id, model):
         """流式响应。"""
+        # 预检：非流式请求检查 401（避免缓冲整个流式响应）
+        preflight = {
+            "model": chat_req.get("model"),
+            "messages": [{"role": "user", "content": "."}],
+            "max_tokens": 1,
+            "stream": False,
+        }
+        try:
+            pf = await client.post(url, json=preflight, headers=headers, timeout=30)
+            if pf.status_code == 401:
+                return JSONResponse(
+                    {"error": {"message": "MIMO 401", "type": "authentication_error"}},
+                    status_code=401,
+                )
+        except Exception:
+            pass
+
         async def stream_generator():
             seq = 0
             # 发送 response.created 事件
