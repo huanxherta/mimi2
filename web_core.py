@@ -637,7 +637,7 @@ def _apply_claw_credentials_sync(users_data: dict, uid_pref=None) -> Tuple[bool,
     return True, rk
 
 
-def _force_refresh_inner_sync(rk_or_err: str) -> bool:
+def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
     """通过 Claw 聊天备份 env + HTTP API 下载提取 OC（失败重试+销毁）"""
     import requests
     from claw_reset_env import connect_with_retry
@@ -834,8 +834,8 @@ def _force_refresh_inner_sync(rk_or_err: str) -> bool:
             client.close()
             return None, None
 
-    # === 主流程：最多重试2次（含销毁重来）===
-    max_attempts = 2
+    # === 主流程：最多重试 oc_max_retry 次（含销毁重来）===
+    max_attempts = _max_attempts
     for attempt in range(max_attempts):
         state.log(f"获取OC尝试 {attempt + 1}/{max_attempts}...")
 
@@ -892,7 +892,9 @@ async def force_refresh_mimo_key_via_claw(
         state.active_user = rk_or_err
 
         loop = asyncio.get_event_loop()
-        result = await loop.run_in_executor(None, _force_refresh_inner_sync, rk_or_err)
+        st = await load_app_state()
+        _max = st.get("oc_max_retry", 3)
+        result = await loop.run_in_executor(None, lambda: _force_refresh_inner_sync(rk_or_err, _max))
 
         if result:
             await persist_mimo_key_to_app_state()
