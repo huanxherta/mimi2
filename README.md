@@ -25,12 +25,12 @@
 ### 密钥管理
 - 自动 MIMO API 密钥提取（通过 host-files API）
 - 密钥有效性探测
-- **后台密钥监控** — 每 30 分钟检查，超过 45 分钟主动刷新
+- **后台密钥监控** — 每 5 分钟检查，超过 50 分钟主动刷新
 - **多密钥轮询** — 支持多个小米账号，每个独立 OC 密钥，请求级轮询
 - **三重保障** — 主动刷新 + 401 等待刷新 + 兜底重试
 
 ### OpenAI 兼容中转
-- OpenAI API 兼容接口（`/v1/chat/completions`，`/v1/models`）
+- OpenAI API 兼容接口（`/v1/chat/completions`，`/v1/models`，`/v1/responses`）
 - 自动密钥注入
 - 模型名称映射
 - 流式响应支持
@@ -95,7 +95,17 @@ name,userId,serviceToken,xiaomichatbot_ph
 3. 备份环境变量
 4. 通过 HTTP API 下载并提取 MIMO_API_KEY
 5. 探测密钥有效性
-6. 失败时自动重试 + 销毁重来
+6. 失败时自动销毁重来（最多 3 次，可通过面板调整）
+
+### 5. 配置中转鉴权（可选）
+
+创建 `.env` 文件：
+
+```
+MIMO_RELAY_OPENAI_KEY=sk-your-key-here
+```
+
+设置后，OpenAI 中转接口需要 Bearer Token 认证。未设置时为开放访问。
 
 ## 文件结构
 
@@ -105,6 +115,7 @@ name,userId,serviceToken,xiaomichatbot_ph
 ├── claw_chat.py        # Claw WebSocket 客户端
 ├── claw_reset_env.py   # 环境重置逻辑
 ├── mimo_openai_shared.py  # OpenAI 共享模块
+├── mimi2_responses.py  # OpenAI Responses API 兼容层
 ├── templates/
 │   └── index.html      # HTML 模板
 ├── static/
@@ -113,7 +124,7 @@ name,userId,serviceToken,xiaomichatbot_ph
 ├── users/              # 用户凭证文件
 ├── app_state.json      # 应用状态
 ├── oc_history.json     # OC 历史
-└── token_stats.json    # Token 统计
+└── .env                # 环境变量（可选）
 ```
 
 ## API 接口
@@ -121,6 +132,7 @@ name,userId,serviceToken,xiaomichatbot_ph
 | 接口 | 方法 | 说明 |
 |------|------|------|
 | `/v1/chat/completions` | POST | OpenAI 兼容聊天 |
+| `/v1/responses` | POST | OpenAI Responses API |
 | `/v1/models` | GET | 模型列表 |
 | `/api/status` | GET | 系统状态 |
 | `/api/accounts_health` | GET | 账号健康检测 |
