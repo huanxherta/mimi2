@@ -5,6 +5,7 @@
 """
 
 import asyncio
+import contextvars
 import json
 import os
 import re
@@ -60,6 +61,8 @@ RELAY_CLIENT_API_KEY = _relay_env.strip() if _relay_env else ""
 
 # ──────────────────── 全局状态 ────────────────────
 
+log_tag: contextvars.ContextVar[Optional[str]] = contextvars.ContextVar("log_tag", default=None)
+
 
 class AppState:
     """线程安全的全局应用状态"""
@@ -73,15 +76,24 @@ class AppState:
         self.last_refresh_error: Optional[str] = None
         self.logs: List[str] = []
         self._lock = asyncio.Lock()
-        self._claw_refresh_lock = asyncio.Lock()
+        self._per_account_locks: Dict[str, asyncio.Lock] = {}  # per-account 锁，支持并发
         self._refresh_event = asyncio.Event()  # 刷新完成事件
         self._refresh_event.set()  # 初始状态：空闲
         self._blacklist: Dict[str, Any] = {}
         self._blacklist_lock = asyncio.Lock()
+        self._pending_refresh_tasks: Dict[str, asyncio.Task] = {}  # rk -> task
 
-    def log(self, msg: str):
+    def get_account_lock(self, rk: str) -> asyncio.Lock:
+        """获取指定账号的刷新锁（惰性创建）"""
+        if rk not in self._per_account_locks:
+            self._per_account_locks[rk] = asyncio.Lock()
+        return self._per_account_locks[rk]
+
+    def log(self, msg: str, tag: Optional[str] = None):
         ts = time.strftime("%H:%M:%S")
-        line = f"[{ts}] {msg}"
+        curr_tag = tag or log_tag.get()
+        tag_str = f" [{curr_tag}]" if curr_tag else ""
+        line = f"[{ts}]{tag_str} {msg}"
         self.logs.append(line)
         if len(self.logs) > 1000:
             self.logs.pop(0)
@@ -589,9 +601,9 @@ async def probe_mimo_oc_via_api_key(api_key: str) -> Optional[bool]:
                             return True
                 except Exception:
                     pass
-                state.log("MIMO OC probe HTTP 200 but invalid body")
+                state.log(f"MIMO OC probe HTTP 200 but invalid body: {r.text[:100]}")
                 return False
-            state.log(f"MIMO OC probe HTTP {r.status_code}")
+            state.log(f"MIMO OC probe HTTP {r.status_code}: {r.text[:100]}")
             return None
         except Exception as e:
             if attempt == 0 and ("timeout" in str(e).lower()):
@@ -615,6 +627,7 @@ async def probe_mimo_oc_via_api() -> Optional[bool]:
 
 
 def _apply_claw_credentials_sync(users_data: dict, uid_pref=None) -> Tuple[bool, str]:
+    """解析凭证，返回 (ok, rk_or_err) 不再设置全局状态"""
     users_map = users_data.get("users", {})
     rk = resolve_user_key(users_map, uid_pref)
     if not rk:
@@ -629,6 +642,7 @@ def _apply_claw_credentials_sync(users_data: dict, uid_pref=None) -> Tuple[bool,
     ph = (u.get("xiaomichatbot_ph") or "").strip()
     if not st or not uid or not ph:
         return False, "Incomplete credentials"
+    # 仍然设置全局（向后兼容面板手动操作等场景）
     _claw_chat_mod.PH = ph
     _claw_chat_mod.COOKIES.clear()
     _claw_chat_mod.COOKIES.update(
@@ -637,17 +651,41 @@ def _apply_claw_credentials_sync(users_data: dict, uid_pref=None) -> Tuple[bool,
     return True, rk
 
 
-def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
+def _extract_credentials(users_data: dict, uid_pref=None) -> Tuple[bool, str, str, dict]:
+    """提取凭证，返回 (ok, rk_or_err, ph, cookies) 不修改全局"""
+    users_map = users_data.get("users", {})
+    rk = resolve_user_key(users_map, uid_pref)
+    if not rk:
+        rk = resolve_user_key(users_map, users_data.get("default", "1"))
+    if not rk:
+        return False, "No accounts, import credentials first", "", {}
+    u = users_map.get(rk)
+    if not u:
+        return False, "User not found", "", {}
+    st = (u.get("serviceToken") or "").strip()
+    uid = str(u.get("userId") or "").strip()
+    ph = (u.get("xiaomichatbot_ph") or "").strip()
+    if not st or not uid or not ph:
+        return False, "Incomplete credentials", "", {}
+    cookies = {"serviceToken": st, "userId": uid, "xiaomichatbot_ph": ph}
+    return True, rk, ph, cookies
+
+
+def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3, ph: str = "", cookies: dict = None) -> bool:
     """通过 Claw 聊天备份 env + HTTP API 下载提取 OC（失败重试+销毁）"""
     import requests
-    from claw_reset_env import connect_with_retry
-
-    ph = _claw_chat_mod.PH
-    cookies = {
-        "serviceToken": _claw_chat_mod.COOKIES.get("serviceToken", ""),
-        "userId": _claw_chat_mod.COOKIES.get("userId", ""),
-        "xiaomichatbot_ph": ph,
-    }
+    from claw_chat import ClawClient
+    
+    # 线程池手动设置标签
+    log_tag.set(f"账号 {rk_or_err}")
+    if not ph or not cookies:
+        # 回退到全局（不应该走到这里）
+        ph = _claw_chat_mod.PH
+        cookies = {
+            "serviceToken": _claw_chat_mod.COOKIES.get("serviceToken", ""),
+            "userId": _claw_chat_mod.COOKIES.get("userId", ""),
+            "xiaomichatbot_ph": ph,
+        }
     headers = {
         "Content-Type": "application/json",
         "Origin": BASE_URL,
@@ -656,26 +694,38 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
     def _download_file(file_path):
         """通过 HTTP API 下载文件内容"""
-        preview_url = (
-            f"{BASE_URL}/open-apis/host-files/preview?xiaomichatbot_ph={quote(ph)}"
-        )
-        r = requests.post(
-            preview_url,
-            cookies=cookies,
-            headers=headers,
-            json={"path": file_path},
-            timeout=15,
-        )
-        d = r.json()
-        if d.get("code") != 0:
+        try:
+            preview_url = (
+                f"{BASE_URL}/open-apis/host-files/preview?xiaomichatbot_ph={quote(ph)}"
+            )
+            r = requests.post(
+                preview_url,
+                cookies=cookies,
+                headers=headers,
+                json={"path": file_path},
+                timeout=15,
+            )
+            if r.status_code != 200:
+                state.log(f"[WARN] HTTP Preview 失败: {r.status_code}")
+                return None
+            d = r.json()
+            if d.get("code") != 0:
+                state.log(f"[WARN] API Preview 报错: {d.get('code')} - {d.get('msg', '')}")
+                return None
+            # 兼容 fdsUrl 和 resourceUrl
+            data_obj = d.get("data") or {}
+            target_url = data_obj.get("fdsUrl") or data_obj.get("resourceUrl")
+            if not target_url:
+                state.log(f"[WARN] 响应中未找到下载链接: {d}")
+                return None
+            r_dl = requests.get(target_url, timeout=30)
+            if r_dl.status_code != 200:
+                state.log(f"[WARN] 下载内容失败: HTTP {r_dl.status_code}")
+                return None
+            return r_dl.text
+        except Exception as e:
+            state.log(f"[ERROR] _download_file 异常: {e}")
             return None
-        fds_url = d.get("data", {}).get("fdsUrl")
-        if not fds_url:
-            return None
-        r = requests.get(fds_url, timeout=30)
-        if r.status_code != 200:
-            return None
-        return r.text
 
     def _find_env_file():
         """找 env 备份文件"""
@@ -706,7 +756,7 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
         return None
 
     def _probe_key(key):
-        """探测 key 是否有效"""
+        """探测 key 是否有效，返回 (bool, reason)"""
         probe_body = {
             "model": "mimo-v2-flash",
             "messages": [{"role": "user", "content": "."}],
@@ -721,15 +771,17 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
                 timeout=60,
             )
             if pr.status_code == 401:
-                return False
+                return False, "HTTP 401 Unauthorized"
             if pr.status_code == 200:
                 pj = pr.json()
-                if pj.get("error") or not pj.get("choices"):
-                    return False
-                return True
-        except Exception:
-            pass
-        return None
+                if pj.get("error"):
+                    return False, f"API Error: {pj.get('error')}"
+                if not pj.get("choices"):
+                    return False, f"Invalid JSON: {pj}"
+                return True, ""
+            return False, f"HTTP {pr.status_code}: {pr.text[:100]}"
+        except Exception as e:
+            return False, f"Exception: {str(e)}"
 
     def _destroy_claw():
         """销毁 Claw 实例"""
@@ -757,10 +809,10 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
     def _try_fetch_oc():
         """单次获取OC流程"""
-        # 1. 连接 Claw，重置SOUL
+        # 1. 连接 Claw，重置SOUL - 使用独立凭证
         state.log(f"[1/5] 连接 Claw (account {rk_or_err})...")
-        client = connect_with_retry()
-        if not client:
+        client = ClawClient(ph=ph, cookies=cookies)
+        if not client.connect():
             state.last_refresh_error = "Claw connect failed"
             return None, None
         state.log("[2/5] 已连接 Claw，发送重置消息...")
@@ -776,8 +828,12 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
         # 2. 重连，备份env
         state.log("[3/5] 重新连接 Claw...")
-        client = connect_with_retry(max_retries=10, delay=8)
-        if not client:
+        client = ClawClient(ph=ph, cookies=cookies)
+        for _retry in range(10):
+            if client.connect():
+                break
+            time.sleep(8)
+        else:
             state.last_refresh_error = "Reconnect failed"
             return None, None
         state.log("[3/5] 已重连，发送备份消息...")
@@ -809,6 +865,7 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
         new_key = extract_mimo_key(content)
         if not new_key:
+            state.log(f"[WARN] 下载成功但未在内容中找到 MIMO_API_KEY (内容长度: {len(content)})")
             state.last_refresh_error = "MIMO_API_KEY not found in env"
             client.close()
             return None, None
@@ -816,23 +873,19 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
         # 5. 探测
         state.log("[5/5] 探测 OC 是否有效...")
-        probe_result = _probe_key(new_key)
-        if probe_result is True:
+        ok, err_msg = _probe_key(new_key)
+        if ok:
             state.log("[5/5] 探测成功!")
             client.close()
             return new_key, None
-        elif probe_result is False:
-            state.log("[5/5] 探测失败，发送安全保存消息...")
+        else:
+            state.log(f"[5/5] 探测失败 ({err_msg})，发送安全保存消息...")
             reply3 = client.send_message("安全保存MIMO_API_KEY", timeout=60)
             state.log(f"[Claw回复-安全保存]: {reply3}")
             saved_path = _extract_path_from_reply(reply3)
             state.log(f"[5/5] 提取路径: {saved_path}")
             client.close()
             return None, saved_path
-        else:
-            state.log("[5/5] 探测无响应")
-            client.close()
-            return None, None
 
     # === 主流程：最多重试 oc_max_retry 次（含销毁重来）===
     max_attempts = _max_attempts
@@ -879,36 +932,48 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 async def force_refresh_mimo_key_via_claw(
     retry: bool = True, uid_pref: Optional[str] = None
 ) -> bool:
-    async with state._claw_refresh_lock:
-        users_data = await load_users()
-        uid = uid_pref if uid_pref is not None else state.active_user
-        if not uid:
-            uid = users_data.get("default", "1")
-        ok, rk_or_err = _apply_claw_credentials_sync(users_data, uid)
-        if not ok:
-            state.last_refresh_error = rk_or_err
-            state.log(rk_or_err)
+    users_data = await load_users()
+    uid = uid_pref if uid_pref is not None else state.active_user
+    if not uid:
+        uid = users_data.get("default", "1")
+    ok, rk_or_err, cred_ph, cred_cookies = _extract_credentials(users_data, uid)
+    if not ok:
+        state.last_refresh_error = rk_or_err
+        state.log(rk_or_err)
+        return False
+    state.active_user = rk_or_err
+
+    # per-account 锁，不同账号可并行
+    account_lock = state.get_account_lock(rk_or_err)
+    async with account_lock:
+        token = log_tag.set(f"账号 {rk_or_err}")
+        try:
+            loop = asyncio.get_event_loop()
+            st = await load_app_state()
+            _max = st.get("oc_max_retry", 3)
+            result = await loop.run_in_executor(
+                None,
+                lambda: _force_refresh_inner_sync(rk_or_err, _max, ph=cred_ph, cookies=cred_cookies)
+            )
+
+            if result:
+                await persist_mimo_key_to_app_state()
+                await persist_oc_to_user_panel(rk_or_err, state.mimo_api_key)
+                await state.blacklist_clear(state.mimo_api_key)
+            else:
+                # 延长黑名单
+                ud = await load_users()
+                u = ud.get("users", {}).get(rk_or_err) if rk_or_err else None
+                if u:
+                    bad_key = (u.get("mimo_api_key") or "").strip()
+                    if bad_key and validate_key(bad_key):
+                        await state.blacklist_extend(bad_key)
+            return result
+        except Exception as e:
+            state.log(f"Force refresh error: {e}")
             return False
-        state.active_user = rk_or_err
-
-        loop = asyncio.get_event_loop()
-        st = await load_app_state()
-        _max = st.get("oc_max_retry", 3)
-        result = await loop.run_in_executor(None, lambda: _force_refresh_inner_sync(rk_or_err, _max))
-
-        if result:
-            await persist_mimo_key_to_app_state()
-            await persist_oc_to_user_panel(rk_or_err, state.mimo_api_key)
-            await state.blacklist_clear(state.mimo_api_key)
-        else:
-            # 延长黑名单
-            ud = await load_users()
-            u = ud.get("users", {}).get(rk_or_err) if rk_or_err else None
-            if u:
-                bad_key = (u.get("mimo_api_key") or "").strip()
-                if bad_key and validate_key(bad_key):
-                    await state.blacklist_extend(bad_key)
-        return result
+        finally:
+            log_tag.reset(token)
 
 
 # ──────────────────── 凭证解析 ────────────────────
@@ -981,6 +1046,24 @@ def parse_credentials_auto(text: str) -> List[dict]:
             ):
                 _flush()
             continue
+
+        # 1. 尝试解析类 Cookie 格式: serviceToken="..."; userId=...; xiaomichatbot_ph="..."
+        if "serviceToken=" in stripped and ";" in stripped:
+            parts = [p.strip() for p in stripped.split(";")]
+            c_data = {}
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    c_data[k.strip()] = _strip_cookie_value(v.strip())
+            
+            if all(k in c_data for k in ("serviceToken", "userId", "xiaomichatbot_ph")):
+                credentials.append({
+                    "name": f"Cookie_{c_data['userId']}",
+                    "userId": str(c_data["userId"]).strip(),
+                    "serviceToken": c_data["serviceToken"],
+                    "xiaomichatbot_ph": c_data["xiaomichatbot_ph"]
+                })
+                continue
         if "," in stripped and stripped.count(",") >= 3:
             parts = [p.strip() for p in stripped.split(",")]
             if len(parts) == 4:
@@ -1020,32 +1103,55 @@ async def retry_on_401(send_func) -> Any:
         rk, k = await pick_relay_oc_round_robin(skip=tried)
         if not k:
             break
-        tried.add(k)
-        resp = await send_func(k, rk)
-        if hasattr(resp, "status_code") and resp.status_code == 401:
-            state.log(f"OC {rk} 401, try next ({attempt + 1}/{max_retry})")
-            await state.blacklist_add(k)
-            # 后台刷新，不阻塞
-            asyncio.create_task(_background_refresh_oc(rk))
-            continue
-        return resp
-
-    # 所有OC都失败，尝试等待刷新完成
-    state.log("所有OC都401，等待后台刷新...")
-    if state._refresh_event.is_set():
-        state._refresh_event.clear()
+        # 设置标签
+        token = log_tag.set(f"账号 {rk}")
         try:
-            await force_refresh_mimo_key_via_claw()
-        finally:
-            state._refresh_event.set()
-
-    # 刷新后重试一次
-    rk, k = await pick_relay_oc_round_robin(skip=tried)
-    if k:
-        state.log(f"刷新后重试 OC {rk}...")
-        resp = await send_func(k, rk)
-        if hasattr(resp, "status_code") and resp.status_code != 401:
+            tried.add(k)
+            resp = await send_func(k, rk)
+            if hasattr(resp, "status_code") and resp.status_code == 401:
+                state.log(f"OC {rk} 401, try next ({attempt + 1}/{max_retry})")
+                await state.blacklist_add(k)
+                # 后台刷新，不阻塞
+                if rk not in state._pending_refresh_tasks:
+                    task = asyncio.create_task(_background_refresh_oc(rk))
+                    state._pending_refresh_tasks[rk] = task
+                continue
             return resp
+        finally:
+            log_tag.reset(token)
+
+    # 所有OC都失败 —— 先等待已启动的后台刷新任务完成
+    pending = list(state._pending_refresh_tasks.values())
+    if pending:
+        state.log(f"所有OC都401，等待 {len(pending)} 个后台刷新任务完成...")
+        await asyncio.gather(*pending, return_exceptions=True)
+        state._pending_refresh_tasks.clear()
+
+        # 后台刷新完毕，重试选 OC
+        rk, k = await pick_relay_oc_round_robin(skip=tried)
+        if k:
+            state.log(f"后台刷新完成，重试 OC {rk}...")
+            resp = await send_func(k, rk)
+            if hasattr(resp, "status_code") and resp.status_code != 401:
+                return resp
+            state.log(f"后台刷新后 OC {rk} 仍然 401")
+    else:
+        state.log("所有OC都401，无后台刷新任务，启动同步刷新...")
+        # 没有后台任务在跑，才同步刷新
+        if state._refresh_event.is_set():
+            state._refresh_event.clear()
+            try:
+                await force_refresh_mimo_key_via_claw()
+            finally:
+                state._refresh_event.set()
+
+        # 刷新后重试一次
+        rk, k = await pick_relay_oc_round_robin(skip=tried)
+        if k:
+            state.log(f"刷新后重试 OC {rk}...")
+            resp = await send_func(k, rk)
+            if hasattr(resp, "status_code") and resp.status_code != 401:
+                return resp
 
     from fastapi.responses import JSONResponse
 
@@ -1061,12 +1167,16 @@ async def retry_on_401(send_func) -> Any:
 
 
 async def _background_refresh_oc(rk: str):
+    token = log_tag.set(f"账号 {rk}")
     try:
         state.log(f"Background refresh OC: {rk}")
         await force_refresh_mimo_key_via_claw(uid_pref=rk, retry=False)
         state.log(f"Background refresh done: {rk}")
     except Exception as e:
         state.log(f"Background refresh error: {rk}: {e}")
+    finally:
+        state._pending_refresh_tasks.pop(rk, None)
+        log_tag.reset(token)
 
 
 # ──────────────────── 认证 ────────────────────

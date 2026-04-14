@@ -172,11 +172,13 @@ def add_user(name, user_id, serviceToken, xiaomichatbot_ph, set_default=False):
     return uid
 
 
-def get_ticket():
-    url = f"{BASE_URL}/open-apis/user/ws/ticket?xiaomichatbot_ph={quote(PH)}"
+def get_ticket(ph=None, cookies=None):
+    _ph = ph or PH
+    _cookies = cookies or COOKIES
+    url = f"{BASE_URL}/open-apis/user/ws/ticket?xiaomichatbot_ph={quote(_ph)}"
     r = requests.get(
         url,
-        cookies=COOKIES,
+        cookies=_cookies,
         headers=_aistudio_cors_json_headers(),
         timeout=15,
     )
@@ -191,21 +193,24 @@ def get_ticket():
 
 
 class ClawClient:
-    def __init__(self):
+    def __init__(self, ph=None, cookies=None):
         self.ws = None
         self.connected = False
         self.responses = {}
         self.events = []
         self.session_key = "agent:main:main"
         self.agent_id = "main"
+        # 支持独立凭证，不传则用全局
+        self._ph = ph or PH
+        self._cookies = dict(cookies) if cookies else dict(COOKIES)
         
     def _create_claw(self):
         """创建/续期 Claw 实例。须 POST（抓包 mimo/[438]，空 body）；浏览器地址栏打开同 URL 会发 GET→405。"""
         _post_agreement_mimo_claw()
-        url = f"{BASE_URL}/open-apis/user/mimo-claw/create?xiaomichatbot_ph={quote(PH)}"
+        url = f"{BASE_URL}/open-apis/user/mimo-claw/create?xiaomichatbot_ph={quote(self._ph)}"
         r = requests.post(
             url,
-            cookies=COOKIES,
+            cookies=self._cookies,
             headers=_aistudio_cors_json_headers(),
             timeout=15,
         )
@@ -222,7 +227,7 @@ class ClawClient:
 
     def connect(self, auto_create=True):
         try:
-            ticket = get_ticket()
+            ticket = get_ticket(ph=self._ph, cookies=self._cookies)
         except Exception as e:
             if not auto_create:
                 raise
@@ -236,11 +241,11 @@ class ClawClient:
             if not wait_mimo_claw_available():
                 return False
             try:
-                ticket = get_ticket()
+                ticket = get_ticket(ph=self._ph, cookies=self._cookies)
             except Exception as e2:
                 print(f"[!] 创建后轮询就绪后仍无法获取 ticket: {e2}", file=sys.stderr)
                 return False
-        cookie_str = "; ".join(f'{k}="{v}"' if ' ' in v or '=' in v else f'{k}={v}' for k, v in COOKIES.items())
+        cookie_str = "; ".join(f'{k}="{v}"' if ' ' in v or '=' in v else f'{k}={v}' for k, v in self._cookies.items())
         self.ws = websocket.WebSocketApp(
             f"{WS_URL}?ticket={ticket}",
             header=[f"Cookie: {cookie_str}", "Origin: https://aistudio.xiaomimimo.com"],
@@ -394,9 +399,9 @@ class ClawClient:
         }
         r = requests.get(
             url,
-            cookies=COOKIES,
+            cookies=self._cookies,
             headers=headers,
-            params={"path": path, "xiaomichatbot_ph": PH},
+            params={"path": path, "xiaomichatbot_ph": self._ph},
             timeout=15,
         )
         d = r.json()
