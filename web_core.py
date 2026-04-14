@@ -649,6 +649,7 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
     
     # 线程池手动设置标签
     log_tag.set(f"账号 {rk_or_err}")
+    ph = _claw_chat_mod.PH
     cookies = {
         "serviceToken": _claw_chat_mod.COOKIES.get("serviceToken", ""),
         "userId": _claw_chat_mod.COOKIES.get("userId", ""),
