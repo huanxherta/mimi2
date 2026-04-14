@@ -1110,13 +1110,18 @@ async def retry_on_401(send_func) -> Any:
             tried.add(k)
             resp = await send_func(k, rk)
             if hasattr(resp, "status_code") and resp.status_code == 401:
-                state.log(f"OC {rk} 401, try next ({attempt + 1}/{max_retry})")
-                await state.blacklist_add(k)
-                # 后台刷新，不阻塞
-                if rk not in state._pending_refresh_tasks:
-                    task = asyncio.create_task(_background_refresh_oc(rk))
-                    state._pending_refresh_tasks[rk] = task
-                continue
+                # 小米 API 有时会在高负载或并发时偶发 401，增加一次快速重试
+                state.log(f"OC {rk} 401, transient check (retry same key)...")
+                await asyncio.sleep(0.5)
+                resp = await send_func(k, rk)
+                if hasattr(resp, "status_code") and resp.status_code == 401:
+                    state.log(f"OC {rk} 401 confirmed, try next ({attempt + 1}/{max_retry})")
+                    await state.blacklist_add(k)
+                    # 后台刷新，不阻塞
+                    if rk not in state._pending_refresh_tasks:
+                        task = asyncio.create_task(_background_refresh_oc(rk))
+                        state._pending_refresh_tasks[rk] = task
+                    continue
             return resp
         finally:
             log_tag.reset(token)

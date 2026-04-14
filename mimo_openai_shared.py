@@ -25,7 +25,8 @@ def apply_model_mapping(data: Any) -> Any:
         return data
     if "model" in data:
         orig = data["model"]
-        data["model"] = MODEL_MAPPING.get(orig, orig)
+        # 如果未在映射表中，默认 fallback 到 mimo-v2-pro（避免小米API遇到陌生模型暴毙报401）
+        data["model"] = MODEL_MAPPING.get(orig, "mimo-v2-pro")
         logger.debug("模型映射: %s -> %s", orig, data["model"])
     return data
 
