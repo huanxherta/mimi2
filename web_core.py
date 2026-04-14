@@ -1112,8 +1112,9 @@ async def retry_on_401(send_func) -> Any:
                 state.log(f"OC {rk} 401, try next ({attempt + 1}/{max_retry})")
                 await state.blacklist_add(k)
                 # 后台刷新，不阻塞
-                task = asyncio.create_task(_background_refresh_oc(rk))
-                state._pending_refresh_tasks[rk] = task
+                if rk not in state._pending_refresh_tasks:
+                    task = asyncio.create_task(_background_refresh_oc(rk))
+                    state._pending_refresh_tasks[rk] = task
                 continue
             return resp
         finally:
