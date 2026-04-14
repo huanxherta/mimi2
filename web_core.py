@@ -663,26 +663,38 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
     def _download_file(file_path):
         """通过 HTTP API 下载文件内容"""
-        preview_url = (
-            f"{BASE_URL}/open-apis/host-files/preview?xiaomichatbot_ph={quote(ph)}"
-        )
-        r = requests.post(
-            preview_url,
-            cookies=cookies,
-            headers=headers,
-            json={"path": file_path},
-            timeout=15,
-        )
-        d = r.json()
-        if d.get("code") != 0:
+        try:
+            preview_url = (
+                f"{BASE_URL}/open-apis/host-files/preview?xiaomichatbot_ph={quote(ph)}"
+            )
+            r = requests.post(
+                preview_url,
+                cookies=cookies,
+                headers=headers,
+                json={"path": file_path},
+                timeout=15,
+            )
+            if r.status_code != 200:
+                state.log(f"[WARN] HTTP Preview 失败: {r.status_code}")
+                return None
+            d = r.json()
+            if d.get("code") != 0:
+                state.log(f"[WARN] API Preview 报错: {d.get('code')} - {d.get('msg', '')}")
+                return None
+            # 兼容 fdsUrl 和 resourceUrl
+            data_obj = d.get("data") or {}
+            target_url = data_obj.get("fdsUrl") or data_obj.get("resourceUrl")
+            if not target_url:
+                state.log(f"[WARN] 响应中未找到下载链接: {d}")
+                return None
+            r_dl = requests.get(target_url, timeout=30)
+            if r_dl.status_code != 200:
+                state.log(f"[WARN] 下载内容失败: HTTP {r_dl.status_code}")
+                return None
+            return r_dl.text
+        except Exception as e:
+            state.log(f"[ERROR] _download_file 异常: {e}")
             return None
-        fds_url = d.get("data", {}).get("fdsUrl")
-        if not fds_url:
-            return None
-        r = requests.get(fds_url, timeout=30)
-        if r.status_code != 200:
-            return None
-        return r.text
 
     def _find_env_file():
         """找 env 备份文件"""
