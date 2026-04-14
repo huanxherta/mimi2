@@ -572,7 +572,7 @@ async def probe_mimo_oc_via_api_key(api_key: str) -> Optional[bool]:
     if not api_key or not validate_key(api_key):
         return None
     probe_body = {
-        "model": "mimo-v2-flash",
+        "model": "mimo-v2-pro",
         "messages": [{"role": "user", "content": "."}],
         "max_tokens": 1,
         "stream": False,
@@ -758,7 +758,7 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3, ph: str = 
     def _probe_key(key):
         """探测 key 是否有效，返回 (bool, reason)"""
         probe_body = {
-            "model": "mimo-v2-flash",
+            "model": "mimo-v2-pro",
             "messages": [{"role": "user", "content": "."}],
             "max_tokens": 1,
             "stream": False,
@@ -910,7 +910,8 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3, ph: str = 
                 new_key = extract_mimo_key(content)
                 if new_key:
                     state.log("探测安全保存的 OC...")
-                    if _probe_key(new_key):
+                    p_ok, p_err = _probe_key(new_key)
+                    if p_ok:
                         state.mimo_api_key = new_key
                         state.last_key_refresh = time.time()
                         state.oc_created_at = time.time()
