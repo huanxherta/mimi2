@@ -21,6 +21,7 @@ from fastapi.staticfiles import StaticFiles
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from web_core import (
     state,
+    log_tag,
     WEB_PANEL_PORT,
     KEY_VALID_DURATION,
     load_users,
@@ -715,17 +716,21 @@ async def key_monitor():
                 continue
 
             for rk, key in pool:
-                # 探测OC是否有效
-                probe = await probe_mimo_oc_via_api_key(key)
-                if probe is False:
-                    state.log(f"Monitor: 账号 {rk} OC已过期，重新申请...")
-                    await force_refresh_mimo_key_via_claw(uid_pref=rk)
-                    need_refresh = True
-                elif probe is None:
-                    # 探测失败，也重新申请
-                    state.log(f"Monitor: 账号 {rk} OC探测失败，重新申请...")
-                    await force_refresh_mimo_key_via_claw(uid_pref=rk)
-                    need_refresh = True
+                token = log_tag.set(f"账号 {rk}")
+                try:
+                    # 探测OC是否有效
+                    probe = await probe_mimo_oc_via_api_key(key)
+                    if probe is False:
+                        state.log(f"Monitor: 账号 {rk} OC已过期，重新申请...")
+                        await force_refresh_mimo_key_via_claw(uid_pref=rk)
+                        need_refresh = True
+                    elif probe is None:
+                        # 探测失败，也重新申请
+                        state.log(f"Monitor: 账号 {rk} OC探测失败，重新申请...")
+                        await force_refresh_mimo_key_via_claw(uid_pref=rk)
+                        need_refresh = True
+                finally:
+                    log_tag.reset(token)
 
             if not need_refresh:
                 # 检查OC创建时间（内存中）
