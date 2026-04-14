@@ -76,12 +76,18 @@ class AppState:
         self.last_refresh_error: Optional[str] = None
         self.logs: List[str] = []
         self._lock = asyncio.Lock()
-        self._claw_refresh_lock = asyncio.Lock()
+        self._per_account_locks: Dict[str, asyncio.Lock] = {}  # per-account 锁，支持并发
         self._refresh_event = asyncio.Event()  # 刷新完成事件
         self._refresh_event.set()  # 初始状态：空闲
         self._blacklist: Dict[str, Any] = {}
         self._blacklist_lock = asyncio.Lock()
         self._pending_refresh_tasks: Dict[str, asyncio.Task] = {}  # rk -> task
+
+    def get_account_lock(self, rk: str) -> asyncio.Lock:
+        """获取指定账号的刷新锁（惰性创建）"""
+        if rk not in self._per_account_locks:
+            self._per_account_locks[rk] = asyncio.Lock()
+        return self._per_account_locks[rk]
 
     def log(self, msg: str, tag: Optional[str] = None):
         ts = time.strftime("%H:%M:%S")
@@ -621,6 +627,7 @@ async def probe_mimo_oc_via_api() -> Optional[bool]:
 
 
 def _apply_claw_credentials_sync(users_data: dict, uid_pref=None) -> Tuple[bool, str]:
+    """解析凭证，返回 (ok, rk_or_err) 不再设置全局状态"""
     users_map = users_data.get("users", {})
     rk = resolve_user_key(users_map, uid_pref)
     if not rk:
@@ -635,6 +642,7 @@ def _apply_claw_credentials_sync(users_data: dict, uid_pref=None) -> Tuple[bool,
     ph = (u.get("xiaomichatbot_ph") or "").strip()
     if not st or not uid or not ph:
         return False, "Incomplete credentials"
+    # 仍然设置全局（向后兼容面板手动操作等场景）
     _claw_chat_mod.PH = ph
     _claw_chat_mod.COOKIES.clear()
     _claw_chat_mod.COOKIES.update(
@@ -643,19 +651,41 @@ def _apply_claw_credentials_sync(users_data: dict, uid_pref=None) -> Tuple[bool,
     return True, rk
 
 
-def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
+def _extract_credentials(users_data: dict, uid_pref=None) -> Tuple[bool, str, str, dict]:
+    """提取凭证，返回 (ok, rk_or_err, ph, cookies) 不修改全局"""
+    users_map = users_data.get("users", {})
+    rk = resolve_user_key(users_map, uid_pref)
+    if not rk:
+        rk = resolve_user_key(users_map, users_data.get("default", "1"))
+    if not rk:
+        return False, "No accounts, import credentials first", "", {}
+    u = users_map.get(rk)
+    if not u:
+        return False, "User not found", "", {}
+    st = (u.get("serviceToken") or "").strip()
+    uid = str(u.get("userId") or "").strip()
+    ph = (u.get("xiaomichatbot_ph") or "").strip()
+    if not st or not uid or not ph:
+        return False, "Incomplete credentials", "", {}
+    cookies = {"serviceToken": st, "userId": uid, "xiaomichatbot_ph": ph}
+    return True, rk, ph, cookies
+
+
+def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3, ph: str = "", cookies: dict = None) -> bool:
     """通过 Claw 聊天备份 env + HTTP API 下载提取 OC（失败重试+销毁）"""
     import requests
-    from claw_reset_env import connect_with_retry
+    from claw_chat import ClawClient
     
     # 线程池手动设置标签
     log_tag.set(f"账号 {rk_or_err}")
-    ph = _claw_chat_mod.PH
-    cookies = {
-        "serviceToken": _claw_chat_mod.COOKIES.get("serviceToken", ""),
-        "userId": _claw_chat_mod.COOKIES.get("userId", ""),
-        "xiaomichatbot_ph": ph,
-    }
+    if not ph or not cookies:
+        # 回退到全局（不应该走到这里）
+        ph = _claw_chat_mod.PH
+        cookies = {
+            "serviceToken": _claw_chat_mod.COOKIES.get("serviceToken", ""),
+            "userId": _claw_chat_mod.COOKIES.get("userId", ""),
+            "xiaomichatbot_ph": ph,
+        }
     headers = {
         "Content-Type": "application/json",
         "Origin": BASE_URL,
@@ -779,10 +809,10 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
     def _try_fetch_oc():
         """单次获取OC流程"""
-        # 1. 连接 Claw，重置SOUL
+        # 1. 连接 Claw，重置SOUL - 使用独立凭证
         state.log(f"[1/5] 连接 Claw (account {rk_or_err})...")
-        client = connect_with_retry()
-        if not client:
+        client = ClawClient(ph=ph, cookies=cookies)
+        if not client.connect():
             state.last_refresh_error = "Claw connect failed"
             return None, None
         state.log("[2/5] 已连接 Claw，发送重置消息...")
@@ -798,8 +828,12 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
         # 2. 重连，备份env
         state.log("[3/5] 重新连接 Claw...")
-        client = connect_with_retry(max_retries=10, delay=8)
-        if not client:
+        client = ClawClient(ph=ph, cookies=cookies)
+        for _retry in range(10):
+            if client.connect():
+                break
+            time.sleep(8)
+        else:
             state.last_refresh_error = "Reconnect failed"
             return None, None
         state.log("[3/5] 已重连，发送备份消息...")
@@ -898,23 +932,29 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 async def force_refresh_mimo_key_via_claw(
     retry: bool = True, uid_pref: Optional[str] = None
 ) -> bool:
-    async with state._claw_refresh_lock:
-        users_data = await load_users()
-        uid = uid_pref if uid_pref is not None else state.active_user
-        if not uid:
-            uid = users_data.get("default", "1")
-        ok, rk_or_err = _apply_claw_credentials_sync(users_data, uid)
-        if not ok:
-            state.last_refresh_error = rk_or_err
-            state.log(rk_or_err)
-            return False
-        state.active_user = rk_or_err
+    users_data = await load_users()
+    uid = uid_pref if uid_pref is not None else state.active_user
+    if not uid:
+        uid = users_data.get("default", "1")
+    ok, rk_or_err, cred_ph, cred_cookies = _extract_credentials(users_data, uid)
+    if not ok:
+        state.last_refresh_error = rk_or_err
+        state.log(rk_or_err)
+        return False
+    state.active_user = rk_or_err
+
+    # per-account 锁，不同账号可并行
+    account_lock = state.get_account_lock(rk_or_err)
+    async with account_lock:
         token = log_tag.set(f"账号 {rk_or_err}")
         try:
             loop = asyncio.get_event_loop()
             st = await load_app_state()
             _max = st.get("oc_max_retry", 3)
-            result = await loop.run_in_executor(None, lambda: _force_refresh_inner_sync(rk_or_err, _max))
+            result = await loop.run_in_executor(
+                None,
+                lambda: _force_refresh_inner_sync(rk_or_err, _max, ph=cred_ph, cookies=cred_cookies)
+            )
 
             if result:
                 await persist_mimo_key_to_app_state()
@@ -1006,6 +1046,24 @@ def parse_credentials_auto(text: str) -> List[dict]:
             ):
                 _flush()
             continue
+
+        # 1. 尝试解析类 Cookie 格式: serviceToken="..."; userId=...; xiaomichatbot_ph="..."
+        if "serviceToken=" in stripped and ";" in stripped:
+            parts = [p.strip() for p in stripped.split(";")]
+            c_data = {}
+            for p in parts:
+                if "=" in p:
+                    k, v = p.split("=", 1)
+                    c_data[k.strip()] = _strip_cookie_value(v.strip())
+            
+            if all(k in c_data for k in ("serviceToken", "userId", "xiaomichatbot_ph")):
+                credentials.append({
+                    "name": f"Cookie_{c_data['userId']}",
+                    "userId": str(c_data["userId"]).strip(),
+                    "serviceToken": c_data["serviceToken"],
+                    "xiaomichatbot_ph": c_data["xiaomichatbot_ph"]
+                })
+                continue
         if "," in stripped and stripped.count(",") >= 3:
             parts = [p.strip() for p in stripped.split(",")]
             if len(parts) == 4:
