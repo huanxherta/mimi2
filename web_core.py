@@ -82,6 +82,22 @@ class AppState:
         self._blacklist: Dict[str, Any] = {}
         self._blacklist_lock = asyncio.Lock()
         self._pending_refresh_tasks: Dict[str, asyncio.Task] = {}  # rk -> task
+        self._key_failures: Dict[str, int] = {}
+        self._key_failures_lock = asyncio.Lock()
+
+    async def record_success(self, key: str):
+        if not key:
+            return
+        async with self._key_failures_lock:
+            if key in self._key_failures:
+                self._key_failures.pop(key, None)
+
+    async def record_failure(self, key: str) -> int:
+        if not key:
+            return 0
+        async with self._key_failures_lock:
+            self._key_failures[key] = self._key_failures.get(key, 0) + 1
+            return self._key_failures[key]
 
     def get_account_lock(self, rk: str) -> asyncio.Lock:
         """获取指定账号的刷新锁（惰性创建）"""
@@ -572,7 +588,7 @@ async def probe_mimo_oc_via_api_key(api_key: str) -> Optional[bool]:
     if not api_key or not validate_key(api_key):
         return None
     probe_body = {
-        "model": "mimo-v2-flash",
+        "model": "mimo-v2-pro",
         "messages": [{"role": "user", "content": "."}],
         "max_tokens": 1,
         "stream": False,
@@ -758,7 +774,7 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3, ph: str = 
     def _probe_key(key):
         """探测 key 是否有效，返回 (bool, reason)"""
         probe_body = {
-            "model": "mimo-v2-flash",
+            "model": "mimo-v2-pro",
             "messages": [{"role": "user", "content": "."}],
             "max_tokens": 1,
             "stream": False,
@@ -910,7 +926,8 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3, ph: str = 
                 new_key = extract_mimo_key(content)
                 if new_key:
                     state.log("探测安全保存的 OC...")
-                    if _probe_key(new_key):
+                    p_ok, p_err = _probe_key(new_key)
+                    if p_ok:
                         state.mimo_api_key = new_key
                         state.last_key_refresh = time.time()
                         state.oc_created_at = time.time()
@@ -1109,13 +1126,23 @@ async def retry_on_401(send_func) -> Any:
             tried.add(k)
             resp = await send_func(k, rk)
             if hasattr(resp, "status_code") and resp.status_code == 401:
-                state.log(f"OC {rk} 401, try next ({attempt + 1}/{max_retry})")
-                await state.blacklist_add(k)
-                # 后台刷新，不阻塞
-                if rk not in state._pending_refresh_tasks:
-                    task = asyncio.create_task(_background_refresh_oc(rk))
-                    state._pending_refresh_tasks[rk] = task
-                continue
+                fail_count = await state.record_failure(k)
+                if fail_count == 1:
+                    state.log(f"OC {rk} 401 (Strike 1), 可能是并发/限流假死, 冷却 60 秒暂不刷新...")
+                    await state.blacklist_extend(k, 60)
+                    continue
+                else:
+                    state.log(f"OC {rk} 401 (Strike {fail_count}), 确认非偶发死亡! 永久拉黑并激活 Claw 刷新...")
+                    await state.blacklist_add(k)
+                    if rk not in state._pending_refresh_tasks:
+                        task = asyncio.create_task(_background_refresh_oc(rk))
+                        state._pending_refresh_tasks[rk] = task
+                    continue
+            
+            # 如果请求成功（非 401），则重置这个 key 的错误计数
+            if hasattr(resp, "status_code") and resp.status_code != 401:
+                await state.record_success(k)
+
             return resp
         finally:
             log_tag.reset(token)
