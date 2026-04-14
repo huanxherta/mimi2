@@ -17,3 +17,5 @@ users/*.json
 
 # 抓包归档可能含 Cookie/Token，默认不纳入版本库
 archive/http_captures/
+*.sh
+.ai_memory/

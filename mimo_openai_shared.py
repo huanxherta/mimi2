@@ -10,11 +10,11 @@ logger = logging.getLogger(__name__)
 
 MIMO_BASE_URL = "https://api.xiaomimimo.com"
 
-# OpenAI 模型名 -> MIMO 模型名（与独立 claw_proxy 行为一致）
+# OpenAI 模型名 -> MIMO 模型名
 MODEL_MAPPING = {
-    "gpt-3.5-turbo": "mimo-gpt-3.5-turbo",
-    "gpt-4": "mimo-gpt-4",
-    "gpt-4-turbo": "mimo-gpt-4-turbo",
+    "gpt-3.5-turbo": "mimo-v2-flash",
+    "gpt-4": "mimo-v2-pro",
+    "gpt-4-turbo": "mimo-v2-pro",
 }
 
 
@@ -31,11 +31,11 @@ def apply_model_mapping(data: Any) -> Any:
 
 
 def build_mimo_json_headers(api_key: Optional[str]) -> Dict[str, str]:
-    """发往 MIMO JSON API 的请求头（与内嵌 /v1 一致，避免盲目转发客户端杂头）。"""
+    """发往 MIMO JSON API 的请求头（使用官方 api-key 格式，不带 Bearer 前缀）。"""
     if not api_key:
         logger.warning("build_mimo_json_headers: api_key 为空")
     return {
-        "Authorization": f"Bearer {api_key or ''}",
+        "api-key": f"{api_key or ''}",
         "Content-Type": "application/json",
         "User-Agent": "MIMO-Proxy/1.0",
     }
