@@ -81,6 +81,7 @@ class AppState:
         self._refresh_event.set()  # 初始状态：空闲
         self._blacklist: Dict[str, Any] = {}
         self._blacklist_lock = asyncio.Lock()
+        self._pending_refresh_tasks: Dict[str, asyncio.Task] = {}  # rk -> task
 
     def log(self, msg: str, tag: Optional[str] = None):
         ts = time.strftime("%H:%M:%S")
@@ -1053,28 +1054,45 @@ async def retry_on_401(send_func) -> Any:
                 state.log(f"OC {rk} 401, try next ({attempt + 1}/{max_retry})")
                 await state.blacklist_add(k)
                 # 后台刷新，不阻塞
-                asyncio.create_task(_background_refresh_oc(rk))
+                task = asyncio.create_task(_background_refresh_oc(rk))
+                state._pending_refresh_tasks[rk] = task
                 continue
             return resp
         finally:
             log_tag.reset(token)
 
-    # 所有OC都失败，尝试等待刷新完成
-    state.log("所有OC都401，等待后台刷新...")
-    if state._refresh_event.is_set():
-        state._refresh_event.clear()
-        try:
-            await force_refresh_mimo_key_via_claw()
-        finally:
-            state._refresh_event.set()
+    # 所有OC都失败 —— 先等待已启动的后台刷新任务完成
+    pending = list(state._pending_refresh_tasks.values())
+    if pending:
+        state.log(f"所有OC都401，等待 {len(pending)} 个后台刷新任务完成...")
+        await asyncio.gather(*pending, return_exceptions=True)
+        state._pending_refresh_tasks.clear()
 
-    # 刷新后重试一次
-    rk, k = await pick_relay_oc_round_robin(skip=tried)
-    if k:
-        state.log(f"刷新后重试 OC {rk}...")
-        resp = await send_func(k, rk)
-        if hasattr(resp, "status_code") and resp.status_code != 401:
-            return resp
+        # 后台刷新完毕，重试选 OC
+        rk, k = await pick_relay_oc_round_robin(skip=tried)
+        if k:
+            state.log(f"后台刷新完成，重试 OC {rk}...")
+            resp = await send_func(k, rk)
+            if hasattr(resp, "status_code") and resp.status_code != 401:
+                return resp
+            state.log(f"后台刷新后 OC {rk} 仍然 401")
+    else:
+        state.log("所有OC都401，无后台刷新任务，启动同步刷新...")
+        # 没有后台任务在跑，才同步刷新
+        if state._refresh_event.is_set():
+            state._refresh_event.clear()
+            try:
+                await force_refresh_mimo_key_via_claw()
+            finally:
+                state._refresh_event.set()
+
+        # 刷新后重试一次
+        rk, k = await pick_relay_oc_round_robin(skip=tried)
+        if k:
+            state.log(f"刷新后重试 OC {rk}...")
+            resp = await send_func(k, rk)
+            if hasattr(resp, "status_code") and resp.status_code != 401:
+                return resp
 
     from fastapi.responses import JSONResponse
 
@@ -1098,6 +1116,7 @@ async def _background_refresh_oc(rk: str):
     except Exception as e:
         state.log(f"Background refresh error: {rk}: {e}")
     finally:
+        state._pending_refresh_tasks.pop(rk, None)
         log_tag.reset(token)
 
 

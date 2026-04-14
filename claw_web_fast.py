@@ -56,6 +56,7 @@ from web_core import (
     build_mimo_json_headers,
     transform_mimo_response_json,
     chat_completion_log_summary,
+    _background_refresh_oc,
 )
 from mimo_openai_shared import MIMO_BASE_URL as _MBU
 from mimi2_responses import create_responses_router
@@ -520,18 +521,28 @@ async def openai_chat_completions(request: Request):
         )
 
     if not await build_relay_oc_pool():
-        users_data = await load_users()
-        users = users_data.get("users", {})
-        for rk, u in users.items():
-            k = (u.get("mimo_api_key") or "").strip()
-            if not k or not validate_key(k):
-                if await force_refresh_mimo_key_via_claw(uid_pref=rk):
-                    break
+        # OC 池为空 → 不阻塞请求，触发/等待后台刷新
+        pending = list(state._pending_refresh_tasks.values())
+        if pending:
+            # 已有后台刷新在跑，短暂等待看能否就绪
+            state.log(f"OC池为空，等待 {len(pending)} 个后台刷新（最多5s）...")
+            await asyncio.wait(pending, timeout=5)
+        else:
+            # 启动后台刷新
+            users_data = await load_users()
+            for rk, u in users_data.get("users", {}).items():
+                k = (u.get("mimo_api_key") or "").strip()
+                if (not k or not validate_key(k)) and rk not in state._pending_refresh_tasks:
+                    task = asyncio.create_task(_background_refresh_oc(rk))
+                    state._pending_refresh_tasks[rk] = task
+            if state._pending_refresh_tasks:
+                state.log("OC池为空，已启动后台刷新")
+
         if not await build_relay_oc_pool():
             return JSONResponse(
                 {
                     "error": {
-                        "message": "MIMO API key unavailable",
+                        "message": "MIMO API key unavailable, background refresh in progress",
                         "type": "authentication_error",
                     }
                 },
@@ -699,48 +710,56 @@ async def openai_proxy_all(request: Request, path: str):
 
 
 async def key_monitor():
-    """后台监控：每5分钟检查OC，过期立即刷新"""
+    """后台监控：每5分钟检查OC，过期启动后台刷新（不阻塞API请求）"""
     while True:
-        await asyncio.sleep(5 * 60)  # 每5分钟检查一次
+        await asyncio.sleep(5 * 60)
         try:
             if not state.mimo_api_key:
                 await sync_mimo_key_from_app_state()
 
-            # 检查所有OC，找出过期的
             pool = await build_relay_oc_pool()
-            need_refresh = False
 
             if not pool:
-                state.log("Monitor: 没有可用OC，主动获取...")
-                await force_refresh_mimo_key_via_claw()
+                state.log("Monitor: 没有可用OC，启动后台获取...")
+                users_data = await load_users()
+                for rk, u in users_data.get("users", {}).items():
+                    if rk not in state._pending_refresh_tasks:
+                        task = asyncio.create_task(_background_refresh_oc(rk))
+                        state._pending_refresh_tasks[rk] = task
                 continue
 
+            # 探测所有 OC，收集需要刷新的账号
+            refresh_rks = []
             for rk, key in pool:
                 token = log_tag.set(f"账号 {rk}")
                 try:
-                    # 探测OC是否有效
                     probe = await probe_mimo_oc_via_api_key(key)
                     if probe is False:
-                        state.log(f"Monitor: 账号 {rk} OC已过期，重新申请...")
-                        await force_refresh_mimo_key_via_claw(uid_pref=rk)
-                        need_refresh = True
+                        state.log(f"Monitor: 账号 {rk} OC已过期")
+                        refresh_rks.append(rk)
                     elif probe is None:
-                        # 探测失败，也重新申请
-                        state.log(f"Monitor: 账号 {rk} OC探测失败，重新申请...")
-                        await force_refresh_mimo_key_via_claw(uid_pref=rk)
-                        need_refresh = True
+                        state.log(f"Monitor: 账号 {rk} OC探测失败")
+                        refresh_rks.append(rk)
                 finally:
                     log_tag.reset(token)
 
-            if not need_refresh:
-                # 检查OC创建时间（内存中）
-                if state.oc_created_at:
-                    age_minutes = (time.time() - state.oc_created_at) / 60
-                    if age_minutes > 50:
-                        state.log(
-                            f"Monitor: OC已创建 {age_minutes:.0f} 分钟，主动刷新..."
-                        )
-                        await force_refresh_mimo_key_via_claw()
+            # 统一启动后台刷新（由 _claw_refresh_lock 保证串行安全）
+            for rk in refresh_rks:
+                if rk not in state._pending_refresh_tasks:
+                    state.log(f"Monitor: 启动后台刷新 {rk}")
+                    task = asyncio.create_task(_background_refresh_oc(rk))
+                    state._pending_refresh_tasks[rk] = task
+
+            if not refresh_rks and state.oc_created_at:
+                age_minutes = (time.time() - state.oc_created_at) / 60
+                if age_minutes > 50:
+                    state.log(
+                        f"Monitor: OC已创建 {age_minutes:.0f} 分钟，启动后台刷新..."
+                    )
+                    for rk, _key in pool:
+                        if rk not in state._pending_refresh_tasks:
+                            task = asyncio.create_task(_background_refresh_oc(rk))
+                            state._pending_refresh_tasks[rk] = task
 
         except asyncio.CancelledError:
             break
