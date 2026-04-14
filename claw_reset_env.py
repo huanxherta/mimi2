@@ -98,15 +98,20 @@ def find_env_file(client):
 
 
 def extract_mimo_key(content):
-    """从 env 文件内容中提取 MIMO_API_KEY"""
+    """从 env 文件内容中提取 MIMO_API_KEY (增强正则版)"""
     if not content:
         return None
-    for line in content.splitlines():
-        line = line.strip()
-        if line.startswith("MIMO_API_KEY="):
-            return line.split("MIMO_API_KEY=", 1)[1]
-        if line.startswith("export MIMO_API_KEY="):
-            return line.split("export MIMO_API_KEY=", 1)[1]
+    # 1. 优先找标准格式：MIMO_API_KEY="xxx" 或 MIMO_API_KEY=xxx
+    # 支持 optional 'export ' 前缀，支持引号
+    match = re.search(r'(?:export\s+)?MIMO_API_KEY=["\']?([a-zA-Z0-9_]{20,})["\']?', content)
+    if match:
+        return match.group(1)
+    
+    # 2. 兜底找所有 oc_ 开头的长字符串
+    match_oc = re.search(r'(oc_[a-zA-Z0-9_]{30,})', content)
+    if match_oc:
+        return match_oc.group(1)
+
     return None
 
 

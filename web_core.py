@@ -830,6 +830,7 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3) -> bool:
 
         new_key = extract_mimo_key(content)
         if not new_key:
+            state.log(f"[WARN] 下载成功但未在内容中找到 MIMO_API_KEY (内容长度: {len(content)})")
             state.last_refresh_error = "MIMO_API_KEY not found in env"
             client.close()
             return None, None
