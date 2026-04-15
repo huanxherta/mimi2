@@ -40,7 +40,7 @@ from web_core import (
     probe_mimo_oc_via_api_key,
     force_refresh_mimo_key_via_claw,
     parse_credentials_auto,
-    _apply_claw_credentials_sync,
+    _extract_credentials, # <-- 替换了原来的 _apply_claw_credentials_sync
     retry_on_401,
     verify_relay_client_authorization,
     get_next_validation_display,
@@ -69,7 +69,7 @@ from mimi2_responses import create_responses_router
 async def lifespan(app: FastAPI):
     await sync_mimo_key_from_app_state()
     monitor_task = asyncio.create_task(key_monitor())
-    state.log("Web panel started (FastAPI)")
+    state.log("Web panel started (FastAPI) - Highly Optimized")
     yield
     monitor_task.cancel()
     client = get_http_client()
@@ -169,19 +169,22 @@ async def api_accounts_health():
     users_data = await load_users()
     du = resolve_user_key(users_data.get("users", {}), users_data.get("default", "1"))
     state.active_user = du or users_data.get("default", "1")
-    accounts = []
-    for uid, user in users_data.get("users", {}).items():
+    
+    # 性能优化：并发探测所有账号的健康状态
+    async def _probe(uid, user):
         r = await probe_account_aistudio(user)
-        accounts.append(
-            {
-                "uid": str(uid),
-                "name": user.get("name") or "Unnamed",
-                "userId": user.get("userId") or "",
-                "ok": r["ok"],
-                "http_status": r.get("http_status"),
-                "message": r.get("message") or "",
-            }
-        )
+        return {
+            "uid": str(uid),
+            "name": user.get("name") or "Unnamed",
+            "userId": user.get("userId") or "",
+            "ok": r["ok"],
+            "http_status": r.get("http_status"),
+            "message": r.get("message") or "",
+        }
+
+    tasks = [_probe(uid, user) for uid, user in users_data.get("users", {}).items()]
+    accounts = await asyncio.gather(*tasks)
+
     return {
         "accounts": accounts,
         "count": len(accounts),
@@ -378,27 +381,26 @@ async def api_update_app_state(req: Request):
 
 @app.post("/api/destroy_claw")
 async def api_destroy_claw():
-    from claw_chat import COOKIES as _C, PH as _P, BASE_URL as _B
+    from claw_chat import BASE_URL as _B
 
     users_data = await load_users()
     if not state.active_user:
         state.active_user = users_data.get("default", "1")
-    ok, rk_or_err = _apply_claw_credentials_sync(users_data, state.active_user)
+        
+    # 修复：使用无状态的 _extract_credentials
+    ok, rk_or_err, ph, cookies = _extract_credentials(users_data, state.active_user)
+    
     if not ok:
         return {"success": False, "error": rk_or_err}
+        
     state.active_user = rk_or_err
-    ph = _C.get("xiaomichatbot_ph", "") or _P
     destroy_url = f"{_B}/open-apis/user/mimo-claw/destroy?xiaomichatbot_ph={quote(str(ph), safe='')}"
-    cookies = {
-        "serviceToken": _C.get("serviceToken", ""),
-        "xiaomichatbot_ph": _C.get("xiaomichatbot_ph", ""),
-        "userId": str(_C.get("userId", "")),
-    }
+    
     try:
         client = get_http_client()
         r = await client.post(
             destroy_url,
-            cookies=cookies,
+            cookies=cookies,  # <-- 直接使用提取出的纯净 cookies
             headers={"Content-Type": "application/json"},
             timeout=30,
         )
@@ -412,7 +414,8 @@ async def api_destroy_claw():
                 s = sresult.get("data", {}).get("status")
                 if s == "DESTROYED":
                     if state.mimo_api_key and validate_key(state.mimo_api_key):
-                        _append_oc_history_sync(state.mimo_api_key, "destroyed")
+                        # 安全地进行后台历史文件追加
+                        asyncio.create_task(_append_oc_history_sync(state.mimo_api_key, "destroyed"))
                     state.mimo_api_key = None
                     state.last_key_refresh = 0
                     st = await load_app_state()
@@ -437,8 +440,9 @@ async def api_oc_catalog():
     users_data = await load_users()
     def_uid = str(users_data.get("default") or "")
     rows = [r async for r in iter_relay_oc_display_rows()]
-    relay_entries = []
-    for row in rows:
+    
+    # 性能优化：并发处理列表，避免逐个请求拖慢面板
+    async def process_row(row):
         u = row["user"]
         oc_key = row["oc_key"]
         saved_at_raw = (row.get("saved_at") or "").strip()
@@ -449,7 +453,7 @@ async def api_oc_catalog():
         if row.get("uses_global_fallback"):
             title += " (global)"
         is_def = str(panel_uid) == def_uid
-        # 体验数据优先用缓存
+        
         cached_exp = u.get("experience_cache")
         now_ts = time.time()
         if (
@@ -467,25 +471,28 @@ async def api_oc_catalog():
                 u["experience_cache"] = tc
             except Exception:
                 pass
-        relay_entries.append(
-            {
-                "uid": str(panel_uid),
-                "title": title,
-                "is_default": is_def,
-                "preview": oc_key_preview(oc_key),
-                "saved_at": saved_at,
-                "oc_expired": oc_expired,
-                "trial": trial,
-                "excluded_from_relay": bool(u.get("mimo_trial_no_expire")),
-            }
-        )
-    pool = await build_relay_oc_pool()
-    import asyncio as _a
+                
+        return {
+            "uid": str(panel_uid),
+            "title": title,
+            "is_default": is_def,
+            "preview": oc_key_preview(oc_key),
+            "saved_at": saved_at,
+            "oc_expired": oc_expired,
+            "trial": trial,
+            "excluded_from_relay": bool(u.get("mimo_trial_no_expire")),
+        }
 
-    loop = _a.get_event_loop()
-    hist = await loop.run_in_executor(
-        None, lambda: __import__("web_core")._load_oc_history_sync()
-    )
+    relay_entries = await asyncio.gather(*(process_row(row) for row in rows))
+    pool = await build_relay_oc_pool()
+    
+    # 使用 I/O 锁保护文件读取
+    async with state.file_io_lock:
+        loop = asyncio.get_event_loop()
+        hist = await loop.run_in_executor(
+            None, lambda: __import__("web_core")._load_oc_history_sync()
+        )
+        
     return {
         "relay_entries": relay_entries,
         "relay_pool_size": len(relay_entries),
@@ -524,11 +531,9 @@ async def openai_chat_completions(request: Request):
         # OC 池为空 → 不阻塞请求，触发/等待后台刷新
         pending = list(state._pending_refresh_tasks.values())
         if pending:
-            # 已有后台刷新在跑，短暂等待看能否就绪
             state.log(f"OC池为空，等待 {len(pending)} 个后台刷新（最多5s）...")
             await asyncio.wait(pending, timeout=5)
         else:
-            # 启动后台刷新
             users_data = await load_users()
             for rk, u in users_data.get("users", {}).items():
                 k = (u.get("mimo_api_key") or "").strip()
@@ -552,6 +557,7 @@ async def openai_chat_completions(request: Request):
     async def send(oc_key, rk):
         raw = await request.json()
         data = dict(raw) if isinstance(raw, dict) else {}
+        
         # 清理空 content 消息
         if "messages" in data and isinstance(data["messages"], list):
             cleaned = []
@@ -560,48 +566,53 @@ async def openai_chat_completions(request: Request):
                     continue
                 cleaned.append(msg)
             data["messages"] = cleaned if cleaned else data["messages"]
+            
         apply_model_mapping(data)
         headers = build_mimo_json_headers(oc_key)
         client = get_http_client()
+        
+        # 性能优化：修复"伪流式输出"，使用 httpx 的 send(stream=True) 并安全透传给 FastAPI
+        req = client.build_request(
+            "POST", 
+            f"{MIMO_BASE_URL}/v1/chat/completions", 
+            json=data, 
+            headers=headers, 
+            timeout=120
+        )
+        r = await client.send(req, stream=True)
+
+        # 必须在这里判定 401 才能让重试机制 (retry_on_401) 生效
+        if r.status_code == 401:
+            await r.aread() # 读取错误信息
+            content = r.content
+            await r.aclose() # 释放连接
+            return Response(
+                content,
+                status_code=401,
+                media_type=r.headers.get("content-type", "application/json"),
+            )
+
         if data.get("stream"):
-            r = await client.post(
-                f"{MIMO_BASE_URL}/v1/chat/completions",
-                json=data,
-                headers=headers,
-                timeout=120,
-            )
-            if r.status_code == 401:
-                return Response(
-                    r.content,
-                    status_code=401,
-                    media_type=r.headers.get("content-type", "application/json"),
-                )
-            ct = r.headers.get("content-type", "text/event-stream; charset=utf-8")
-
             async def gen():
-                async for chunk in r.aiter_bytes(chunk_size=8192):
-                    if chunk:
-                        yield chunk
-
-            return StreamingResponse(gen(), status_code=200, media_type=ct)
+                try:
+                    async for chunk in r.aiter_bytes(chunk_size=8192):
+                        if chunk:
+                            yield chunk
+                finally:
+                    await r.aclose() # 流传输结束时必须释放连接资源
+                    
+            ct = r.headers.get("content-type", "text/event-stream; charset=utf-8")
+            return StreamingResponse(gen(), status_code=r.status_code, media_type=ct)
         else:
-            r = await client.post(
-                f"{MIMO_BASE_URL}/v1/chat/completions",
-                json=data,
-                headers=headers,
-                timeout=120,
+            await r.aread() # 非流式：读取完整内容
+            content = r.content
+            status = r.status_code
+            await r.aclose()
+            return Response(
+                content, 
+                status_code=status, 
+                media_type=r.headers.get("content-type", "application/json")
             )
-            if r.status_code == 401:
-                return Response(
-                    r.content,
-                    status_code=401,
-                    media_type=r.headers.get("content-type", "application/json"),
-                )
-            try:
-                td = r.json()
-            except Exception:
-                td = r.text
-            return JSONResponse(td, status_code=r.status_code)
 
     return await retry_on_401(send)
 
@@ -728,13 +739,12 @@ async def key_monitor():
                         state._pending_refresh_tasks[rk] = task
                 continue
 
-            # 探测所有 OC，收集需要刷新的账号
-            refresh_rks = []
+            # 性能优化：并发探测所有 OC，解决单线程遍历导致的几分钟延迟问题
             users_data = await load_users()
-            for rk, key in pool:
+            
+            async def check_key(rk, key):
                 token = log_tag.set(f"账号 {rk}")
                 try:
-                    # 刚刷新的 key 跳过 probe（避免假 401 误判）
                     u = users_data.get("users", {}).get(rk, {})
                     saved_at = (u.get("mimo_api_key_saved_at") or "").strip()
                     if saved_at:
@@ -744,21 +754,28 @@ async def key_monitor():
                             age_min = (time.time() - saved_ts) / 60
                             if age_min < 5:
                                 state.log(f"Monitor: 账号 {rk} key 刚刷新 {age_min:.1f} 分钟，跳过 probe")
-                                continue
+                                return rk, True
                         except Exception:
                             pass
-
                     probe = await probe_mimo_oc_via_api_key(key)
-                    if probe is False:
-                        state.log(f"Monitor: 账号 {rk} OC已过期")
-                        refresh_rks.append(rk)
-                    elif probe is None:
-                        state.log(f"Monitor: 账号 {rk} OC探测失败")
-                        refresh_rks.append(rk)
+                    return rk, probe
                 finally:
                     log_tag.reset(token)
 
-            # 统一启动后台刷新（由 _claw_refresh_lock 保证串行安全）
+            # 并发执行检查
+            tasks = [check_key(rk, key) for rk, key in pool]
+            results = await asyncio.gather(*tasks)
+            
+            refresh_rks = []
+            for rk, probe in results:
+                if probe is False:
+                    state.log(f"Monitor: 账号 {rk} OC已过期")
+                    refresh_rks.append(rk)
+                elif probe is None:
+                    state.log(f"Monitor: 账号 {rk} OC探测失败")
+                    refresh_rks.append(rk)
+
+            # 统一启动后台刷新
             for rk in refresh_rks:
                 if rk not in state._pending_refresh_tasks:
                     state.log(f"Monitor: 启动后台刷新 {rk}")
@@ -788,3 +805,4 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=WEB_PANEL_PORT, log_level="info")
+    
