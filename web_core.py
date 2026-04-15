@@ -906,22 +906,9 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3, ph: str = 
             client.close()
             return None, None
         state.log(f"[4/5] 提取到密钥: {new_key[:15]}...")
-
-        # 5. 探测
-        state.log("[5/5] 探测 OC 是否有效...")
-        ok, err_msg = _probe_key(new_key)
-        if ok:
-            state.log("[5/5] 探测成功!")
-            client.close()
-            return new_key, None
-        else:
-            state.log(f"[5/5] 探测失败 ({err_msg})，发送安全保存消息...")
-            reply3 = client.send_message("安全保存MIMO_API_KEY", timeout=60)
-            state.log(f"[Claw回复-安全保存]: {reply3}")
-            saved_path = _extract_path_from_reply(reply3)
-            state.log(f"[5/5] 提取路径: {saved_path}")
-            client.close()
-            return None, saved_path
+        state.log("[5/5] 依据配置跳过探测，直接返回提取的密钥。")
+        client.close()
+        return new_key, None
 
     # === 主流程：最多重试 oc_max_retry 次（含销毁重来）===
     max_attempts = _max_attempts
