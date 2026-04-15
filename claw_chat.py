@@ -186,7 +186,7 @@ class ClawClient:
         self.agent_id = "main"
         self._ph = ph or PH
         self._cookies = dict(cookies) if cookies else dict(COOKIES)
-        self._http = httpx.AsyncClient(timeout=30)
+        self._http = httpx.AsyncClient(timeout=120)
         self._listen_task = None
         
     async def _create_claw(self):
