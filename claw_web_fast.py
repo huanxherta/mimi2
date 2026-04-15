@@ -50,7 +50,7 @@ from web_core import (
     validate_key,
     oc_key_preview,
     _check_oc_expired,
-    _append_oc_history_sync,
+    append_oc_history,
     MIMO_BASE_URL,
     apply_model_mapping,
     build_mimo_json_headers,
@@ -415,7 +415,7 @@ async def api_destroy_claw():
                 if s == "DESTROYED":
                     if state.mimo_api_key and validate_key(state.mimo_api_key):
                         # 安全地进行后台历史文件追加
-                        asyncio.create_task(_append_oc_history_sync(state.mimo_api_key, "destroyed"))
+                        asyncio.create_task(append_oc_history(state.mimo_api_key, "destroyed"))
                     state.mimo_api_key = None
                     state.last_key_refresh = 0
                     st = await load_app_state()
@@ -805,4 +805,3 @@ if __name__ == "__main__":
     import uvicorn
 
     uvicorn.run(app, host="0.0.0.0", port=WEB_PANEL_PORT, log_level="info")
-    
