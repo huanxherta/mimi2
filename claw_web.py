@@ -114,7 +114,7 @@ def _clear_oc_blacklist(key):
         _oc_blacklist.pop(key, None)
 
 
-def _extend_oc_blacklist(key, duration=1800):
+def _extend_oc_blacklist(key, duration=60):
     """延长黑名单时间（默认 30 分钟）。Claw 重拉失败时调用，避免频繁重试坏 key。"""
     if not key:
         return
@@ -1501,10 +1501,10 @@ def _retry_on_401(request, send_func):
     # 全部失败
     return jsonify({
         "error": {
-            "message": "All OC keys exhausted (401), tried " + str(len(tried)) + " keys",
-            "type": "authentication_error"
+            "message": "All OC keys exhausted (429), tried " + str(len(tried)) + " keys",
+            "type": "rate_limit_error"
         }
-    }), 401
+    }), 429
 
 
 def _probe_chat_timeout_retryable(exc):
