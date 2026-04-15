@@ -226,13 +226,24 @@ class ClawClient:
                 return False
 
         cookie_str = "; ".join(f'{k}="{v}"' if ' ' in v or '=' in v else f'{k}={v}' for k, v in self._cookies.items())
+        headers_dict = {"Cookie": cookie_str, "Origin": BASE_URL}
         
         try:
-            # 兼容不同版本的 websockets 的 header 参数名
-            self.ws = await websockets.connect(
-                f"{WS_URL}?ticket={ticket}",
-                extra_headers={"Cookie": cookie_str, "Origin": BASE_URL}
-            )
+            try:
+                # 优先尝试 websockets >= 14.0 的新版 API 参数
+                self.ws = await websockets.connect(
+                    f"{WS_URL}?ticket={ticket}",
+                    additional_headers=headers_dict
+                )
+            except TypeError as e:
+                # 如果抛出了未预期的 additional_headers 参数，说明你用的是旧版本 (<14.0)
+                if "additional_headers" in str(e):
+                    self.ws = await websockets.connect(
+                        f"{WS_URL}?ticket={ticket}",
+                        extra_headers=headers_dict
+                    )
+                else:
+                    raise
         except Exception as e:
             print(f"WS Connect Error: {e}", file=sys.stderr)
             return False
