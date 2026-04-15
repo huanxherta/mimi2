@@ -82,22 +82,37 @@ class AppState:
         self._blacklist: Dict[str, Any] = {}
         self._blacklist_lock = asyncio.Lock()
         self._pending_refresh_tasks: Dict[str, asyncio.Task] = {}  # rk -> task
-        self._key_failures: Dict[str, int] = {}
+        self._key_failures: Dict[str, list] = {}  # key -> [timestamp, ...]
         self._key_failures_lock = asyncio.Lock()
 
     async def record_success(self, key: str):
         if not key:
             return
         async with self._key_failures_lock:
-            if key in self._key_failures:
-                self._key_failures.pop(key, None)
+            self._key_failures.pop(key, None)
 
     async def record_failure(self, key: str) -> int:
+        """记录 401 时间戳，返回 3 分钟内的失败次数。"""
         if not key:
             return 0
+        now = time.time()
         async with self._key_failures_lock:
-            self._key_failures[key] = self._key_failures.get(key, 0) + 1
-            return self._key_failures[key]
+            cutoff = now - 180  # 3 分钟窗口
+            ts_list = [t for t in self._key_failures.get(key, []) if t > cutoff]
+            ts_list.append(now)
+            self._key_failures[key] = ts_list
+            return len(ts_list)
+
+    async def is_key_dead(self, key: str, threshold: int = 5) -> bool:
+        """3 分钟内累计 threshold 次 401 → 判定为死 key。"""
+        if not key:
+            return False
+        now = time.time()
+        async with self._key_failures_lock:
+            cutoff = now - 180
+            ts_list = [t for t in self._key_failures.get(key, []) if t > cutoff]
+            self._key_failures[key] = ts_list
+            return len(ts_list) >= threshold
 
     def get_account_lock(self, rk: str) -> asyncio.Lock:
         """获取指定账号的刷新锁（惰性创建）"""
@@ -145,7 +160,7 @@ class AppState:
         async with self._blacklist_lock:
             self._blacklist.pop(key, None)
 
-    async def blacklist_extend(self, key: str, duration: int = 1800):
+    async def blacklist_extend(self, key: str, duration: int = 60):
         if not key:
             return
         expire_at = time.time() + duration
@@ -588,13 +603,14 @@ async def probe_mimo_oc_via_api_key(api_key: str) -> Optional[bool]:
     if not api_key or not validate_key(api_key):
         return None
     probe_body = {
-        "model": "mimo-v2-pro",
+        "model": "mimo-v2-omni",
         "messages": [{"role": "user", "content": "."}],
         "max_tokens": 1,
         "stream": False,
     }
     client = get_http_client()
-    for attempt in range(2):
+    # 假 401 概率高，加重试：最多 3 次，每次间隔 1 秒
+    for attempt in range(3):
         try:
             r = await client.post(
                 f"{MIMO_BASE_URL}/v1/chat/completions",
@@ -603,6 +619,10 @@ async def probe_mimo_oc_via_api_key(api_key: str) -> Optional[bool]:
                 timeout=60,
             )
             if r.status_code == 401:
+                if attempt < 2:
+                    state.log(f"Probe 401 (attempt {attempt+1}/3), retrying...")
+                    await asyncio.sleep(1)
+                    continue
                 return False
             if r.status_code == 200:
                 try:
@@ -774,7 +794,7 @@ def _force_refresh_inner_sync(rk_or_err: str, _max_attempts: int = 3, ph: str = 
     def _probe_key(key):
         """探测 key 是否有效，返回 (bool, reason)"""
         probe_body = {
-            "model": "mimo-v2-pro",
+            "model": "mimo-v2-omni",
             "messages": [{"role": "user", "content": "."}],
             "max_tokens": 1,
             "stream": False,
@@ -1120,62 +1140,41 @@ async def retry_on_401(send_func) -> Any:
         rk, k = await pick_relay_oc_round_robin(skip=tried)
         if not k:
             break
-        # 设置标签
         token = log_tag.set(f"账号 {rk}")
         try:
             tried.add(k)
             resp = await send_func(k, rk)
             if hasattr(resp, "status_code") and resp.status_code == 401:
-                fail_count = await state.record_failure(k)
-                if fail_count == 1:
-                    state.log(f"OC {rk} 401 (Strike 1), 可能是并发/限流假死, 冷却 60 秒暂不刷新...")
-                    await state.blacklist_extend(k, 60)
+                # 同 key 快速重试一次
+                state.log(f"OC {rk} 假 401，同 key 立即重试...")
+                resp = await send_func(k, rk)
+                if hasattr(resp, "status_code") and resp.status_code == 401:
+                    count = await state.record_failure(k)
+                    if await state.is_key_dead(k):
+                        state.log(f"OC {rk} 3 分钟内 {count} 次 401，判定死 key，触发 Claw 刷新")
+                        await state.blacklist_add(k)
+                        if rk not in state._pending_refresh_tasks:
+                            task = asyncio.create_task(_background_refresh_oc(rk))
+                            state._pending_refresh_tasks[rk] = task
+                    else:
+                        state.log(f"OC {rk} 重试仍 401（累计 {count}/5），换下一个 key")
                     continue
-                else:
-                    state.log(f"OC {rk} 401 (Strike {fail_count}), 确认非偶发死亡! 永久拉黑并激活 Claw 刷新...")
-                    await state.blacklist_add(k)
-                    if rk not in state._pending_refresh_tasks:
-                        task = asyncio.create_task(_background_refresh_oc(rk))
-                        state._pending_refresh_tasks[rk] = task
-                    continue
-            
-            # 如果请求成功（非 401），则重置这个 key 的错误计数
+            # 成功
             if hasattr(resp, "status_code") and resp.status_code != 401:
                 await state.record_success(k)
-
             return resp
         finally:
             log_tag.reset(token)
 
-    # 所有OC都失败 —— 先等待已启动的后台刷新任务完成
+    # 全部失败
     pending = list(state._pending_refresh_tasks.values())
     if pending:
         state.log(f"所有OC都401，等待 {len(pending)} 个后台刷新任务完成...")
         await asyncio.gather(*pending, return_exceptions=True)
         state._pending_refresh_tasks.clear()
-
-        # 后台刷新完毕，重试选 OC
         rk, k = await pick_relay_oc_round_robin(skip=tried)
         if k:
             state.log(f"后台刷新完成，重试 OC {rk}...")
-            resp = await send_func(k, rk)
-            if hasattr(resp, "status_code") and resp.status_code != 401:
-                return resp
-            state.log(f"后台刷新后 OC {rk} 仍然 401")
-    else:
-        state.log("所有OC都401，无后台刷新任务，启动同步刷新...")
-        # 没有后台任务在跑，才同步刷新
-        if state._refresh_event.is_set():
-            state._refresh_event.clear()
-            try:
-                await force_refresh_mimo_key_via_claw()
-            finally:
-                state._refresh_event.set()
-
-        # 刷新后重试一次
-        rk, k = await pick_relay_oc_round_robin(skip=tried)
-        if k:
-            state.log(f"刷新后重试 OC {rk}...")
             resp = await send_func(k, rk)
             if hasattr(resp, "status_code") and resp.status_code != 401:
                 return resp
@@ -1185,11 +1184,11 @@ async def retry_on_401(send_func) -> Any:
     return JSONResponse(
         {
             "error": {
-                "message": f"All OC keys exhausted (401), tried {len(tried)} keys",
-                "type": "authentication_error",
+                "message": f"All OC keys exhausted (429), tried {len(tried)} keys",
+                "type": "rate_limit_error",
             }
         },
-        status_code=401,
+        status_code=429,
     )
 
 

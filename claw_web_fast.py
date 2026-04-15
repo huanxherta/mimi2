@@ -730,9 +730,24 @@ async def key_monitor():
 
             # 探测所有 OC，收集需要刷新的账号
             refresh_rks = []
+            users_data = await load_users()
             for rk, key in pool:
                 token = log_tag.set(f"账号 {rk}")
                 try:
+                    # 刚刷新的 key 跳过 probe（避免假 401 误判）
+                    u = users_data.get("users", {}).get(rk, {})
+                    saved_at = (u.get("mimo_api_key_saved_at") or "").strip()
+                    if saved_at:
+                        try:
+                            from datetime import datetime
+                            saved_ts = datetime.strptime(saved_at, "%Y-%m-%d %H:%M:%S").timestamp()
+                            age_min = (time.time() - saved_ts) / 60
+                            if age_min < 5:
+                                state.log(f"Monitor: 账号 {rk} key 刚刷新 {age_min:.1f} 分钟，跳过 probe")
+                                continue
+                        except Exception:
+                            pass
+
                     probe = await probe_mimo_oc_via_api_key(key)
                     if probe is False:
                         state.log(f"Monitor: 账号 {rk} OC已过期")
