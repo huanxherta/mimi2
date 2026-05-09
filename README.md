@@ -1,5 +1,4 @@
-# Xiaomi AI Studio Claw Automation Control
-
+# 4月底更新后，已变成内网，此项目已失效
 高性能 Web 控制面板，用于小米 AI Studio Claw 自动化控制：环境重置、凭证管理、密钥管理、OpenAI 兼容中转。
 
 ## 功能
